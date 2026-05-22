@@ -311,94 +311,62 @@ except Exception as e:
     raise
 
 # ── Build Slack message ───────────────────────────────────────────────────────
-def make_table(headers, rows):
-    str_rows = [[str(c) for c in row] for row in rows]
-    all_rows = [headers] + str_rows
-    widths = [max(len(r[i]) for r in all_rows) for i in range(len(headers))]
-    sep = "  ".join("-" * w for w in widths)
-    out = ["  ".join(h.ljust(w) for h, w in zip(headers, widths)), sep]
-    for row in str_rows:
-        out.append("  ".join(c.ljust(w) for c, w in zip(row, widths)))
-    return "```\n" + "\n".join(out) + "\n```"
-
 lines = [
     f"\U0001f4e6 *Goatbox Daily Report — {DATE}*",
     "",
     f"*{total_payers}* payers  ·  *{total_txns}* transactions  ·  *${total_rev:,.2f}* revenue  ·  "
     f"*${avg_spend:,.2f}* avg spend  ·  {coupon_count} coupon transactions  ·  *{dau}* daily active users",
     "",
-    "*Payer Cohort*",
-    f"*{len(new_payers)}* new payers  ·  *{len(return_payers)}* return payers",
+    f"*Payer Cohort* — *{len(new_payers)}* new  ·  *{len(return_payers)}* returning",
 ]
 
 if return_payers:
-    lines += [
-        "",
-        make_table(
-            ["User ID", "Lifetime Purchases", "LTV", "Days Since Last", "Last Prior Purchase"],
-            [(r["user_id"], r["lifetime_purchases"], f"${float(r['lifetime_value_usd']):,.2f}",
-              r["days_since_last_purchase"] if r["days_since_last_purchase"] is not None else "N/A",
-              str(r["last_prior_purchase_date"]) if r["last_prior_purchase_date"] else "N/A")
-             for r in return_payers],
-        ),
-    ]
+    lines.append("")
+    for r in return_payers:
+        days = r["days_since_last_purchase"]
+        last = str(r["last_prior_purchase_date"]) if r["last_prior_purchase_date"] else "N/A"
+        lines.append(
+            f"• `{r['user_id']}` — {r['lifetime_purchases']} purchases · "
+            f"${float(r['lifetime_value_usd']):,.2f} LTV · "
+            f"last seen {days if days is not None else 'N/A'} days ago ({last})"
+        )
 
-lines += [
-    "",
-    "*Revenue by Store Product*",
-    "",
-    make_table(
-        ["Product", "Payers", "Transactions", "Revenue", "Avg Spend"],
-        [(clean_slug(r["product_slug"]), r["payers"], r["transactions"],
-          f"${float(r['revenue_usd']):,.2f}", f"${float(r['avg_usd']):,.2f}")
-         for r in by_product],
-    ),
-]
+lines += ["", "*Revenue by Store Product*", ""]
+for r in by_product:
+    lines.append(
+        f"• *{clean_slug(r['product_slug'])}* — "
+        f"{r['payers']} payers · {r['transactions']} txns · "
+        f"${float(r['revenue_usd']):,.2f} · ${float(r['avg_usd']):,.2f} avg"
+    )
 
-lines += [
-    "",
-    "*Top Box Opens*",
-    "",
-    make_table(
-        ["Box", "Volatility", "Opens", "Unique Openers", "Box Price (coins)"],
-        [(r["box_display_name"], r["box_volatility"], r["total_opens"],
-          r["unique_openers"], r["box_price_coins"])
-         for r in box_opens],
-    ),
-]
+lines += ["", "*Top Box Opens*", ""]
+for r in box_opens:
+    lines.append(
+        f"• *{r['box_display_name']}* (vol {r['box_volatility']}) — "
+        f"{r['total_opens']} opens · {r['unique_openers']} users · {r['box_price_coins']} coins/box"
+    )
 
 if top_box_name and top_box_users:
-    lines += [
-        "",
-        f"*Who Opened '{top_box_name}'*",
-        "",
-        make_table(
-            ["User ID", "Opens", "Coins Spent"],
-            [(r["user_id"], r["opens"], f"{float(r['coins_spent']):,.0f}")
-             for r in top_box_users],
-        ),
-    ]
+    lines += ["", f"*Who Opened '{top_box_name}'*", ""]
+    for r in top_box_users:
+        lines.append(
+            f"• `{r['user_id']}` — {r['opens']} opens · {float(r['coins_spent']):,.0f} coins"
+        )
 
-lines += [
-    "",
-    "*Top Openers*",
-    "",
-    make_table(
-        ["User ID", "Boxes Opened", "Distinct Boxes", "Coins Spent"],
-        [(r["user_id"], r["total_boxes_opened"], r["distinct_boxes"],
-          f"{int(r['total_coins_spent']):,}")
-         for r in top_openers],
-    ),
-    "",
-    "*Top Spenders*",
-    "",
-    make_table(
-        ["User ID", "Transactions", "Total Spend", "Products"],
-        [(r["user_id"], r["transactions"], f"${float(r['total_spend_usd']):,.2f}",
-          ", ".join(clean_slug(p.strip()) for p in r["products_bought"].split(",")))
-         for r in top_spenders],
-    ),
-]
+lines += ["", "*Top Openers*", ""]
+for i, r in enumerate(top_openers, 1):
+    lines.append(
+        f"{i}. `{r['user_id']}` — {r['total_boxes_opened']} boxes · "
+        f"{r['distinct_boxes']} types · {int(r['total_coins_spent']):,} coins"
+    )
+
+lines += ["", "*Top Spenders*", ""]
+for i, r in enumerate(top_spenders, 1):
+    products = ", ".join(clean_slug(p.strip()) for p in r["products_bought"].split(","))
+    lines.append(
+        f"{i}. `{r['user_id']}` — {r['transactions']} txns · "
+        f"${float(r['total_spend_usd']):,.2f} · {products}"
+    )
 
 # ── Observations ──────────────────────────────────────────────────────────────
 new_count  = len(new_payers)
@@ -414,19 +382,19 @@ candidates = []  # list of (priority, text) — higher priority = more noteworth
 
 # 1. Cohort split
 if new_count == total_payers:
-    candidates.append((10, f"**All new payers:** Every payer today was a first-time buyer. "
+    candidates.append((10, f"*\1* Every payer today was a first-time buyer. "
                            f"{new_count} new users generated ${new_rev:,.2f} at ${new_avg:,.2f} avg."))
 elif ret_count == total_payers:
-    candidates.append((10, f"**All return payers:** No new buyers today. "
+    candidates.append((10, f"*\1* No new buyers today. "
                            f"{ret_count} returning users generated ${ret_rev:,.2f} at ${ret_avg:,.2f} avg."))
 elif pct_new >= 70:
-    candidates.append((9, f"**Heavy new payer skew:** {new_count} of {total_payers} payers ({pct_new}%) were new, "
+    candidates.append((9, f"*\1* {new_count} of {total_payers} payers ({pct_new}%) were new, "
                           f"contributing ${new_rev:,.2f} vs ${ret_rev:,.2f} from {ret_count} returning users."))
 elif pct_new <= 30:
-    candidates.append((9, f"**Return payer dominated:** {ret_count} of {total_payers} payers ({100-pct_new}%) were returning, "
+    candidates.append((9, f"*\1* {ret_count} of {total_payers} payers ({100-pct_new}%) were returning, "
                           f"driving ${ret_rev:,.2f} ({round(ret_rev/total_rev*100)}% of revenue)."))
 else:
-    candidates.append((6, f"**Balanced cohort:** {new_count} new payers (${new_avg:,.2f} avg) vs "
+    candidates.append((6, f"*\1* {new_count} new payers (${new_avg:,.2f} avg) vs "
                           f"{ret_count} returning (${ret_avg:,.2f} avg) — "
                           f"{'returners spent more per head' if ret_avg > new_avg else 'new users spent more per head'}."))
 
@@ -436,11 +404,11 @@ if return_payers:
     if gaps:
         max_gap, max_gap_user = max(gaps, key=lambda x: x[0])
         if max_gap >= 14:
-            candidates.append((9, f"**Long re-engagement:** User {max_gap_user['user_id']} returned after "
+            candidates.append((9, f"*\1* User {max_gap_user['user_id']} returned after "
                                    f"{max_gap} days away with ${float(max_gap_user['lifetime_value_usd']):,.2f} LTV "
                                    f"across {max_gap_user['lifetime_purchases']} lifetime purchases."))
         elif max_gap >= 5:
-            candidates.append((7, f"**Re-engagement gap:** Top returning user came back after {max_gap} days "
+            candidates.append((7, f"*\1* Top returning user came back after {max_gap} days "
                                    f"(${float(max_gap_user['lifetime_value_usd']):,.2f} LTV)."))
 
 # 3. Power user spend concentration
@@ -448,11 +416,11 @@ if top_spenders:
     top_spend = float(top_spenders[0]["total_spend_usd"])
     top_pct   = round(top_spend / total_rev * 100)
     if top_pct >= 40:
-        candidates.append((8, f"**Spend concentration:** Top spender (user {top_spenders[0]['user_id']}) "
+        candidates.append((8, f"*\1* Top spender (user {top_spenders[0]['user_id']}) "
                                f"accounted for ${top_spend:,.2f} ({top_pct}% of total revenue) "
                                f"across {top_spenders[0]['transactions']} transactions."))
     elif top_pct >= 25:
-        candidates.append((6, f"**Top spender drove {top_pct}% of revenue:** "
+        candidates.append((6, f"*\1* "
                                f"${top_spend:,.2f} from user {top_spenders[0]['user_id']}."))
 
 # 4. Box opens concentration
@@ -463,10 +431,10 @@ if box_opens and top_box_users:
     top_user_opens   = top_box_users[0]["opens"]
     top_user_pct     = round(top_user_opens / top_box_opens * 100)
     if top_user_pct >= 80:
-        candidates.append((8, f"**{top_box_name} monopolised:** One user opened {top_user_opens:,} of "
+        candidates.append((8, f"*\1* One user opened {top_user_opens:,} of "
                                f"{top_box_opens:,} {top_box_name} boxes ({top_user_pct}%)."))
     elif top_box_pct >= 50:
-        candidates.append((7, f"**{top_box_name} dominates opens:** {top_box_opens:,} opens "
+        candidates.append((7, f"*\1* {top_box_opens:,} opens "
                                f"({top_box_pct}% of all {total_opens_all:,}) across "
                                f"{box_opens[0]['unique_openers']} users."))
 
@@ -474,10 +442,10 @@ if box_opens and top_box_users:
 if total_txns > 0:
     coupon_pct = round(coupon_count / total_txns * 100)
     if coupon_pct >= 40:
-        candidates.append((7, f"**High coupon usage:** {coupon_count} of {total_txns} transactions ({coupon_pct}%) "
+        candidates.append((7, f"*\1* {coupon_count} of {total_txns} transactions ({coupon_pct}%) "
                                f"used a coupon code, suggesting active discount-driven purchasing."))
     elif coupon_pct == 0 and total_txns >= 5:
-        candidates.append((5, f"**No coupons today:** All {total_txns} transactions were full price."))
+        candidates.append((5, f"*\1* All {total_txns} transactions were full price."))
 
 # 6. Box volatility preference
 if box_opens:
@@ -486,16 +454,16 @@ if box_opens:
     high_vol_opens  = sum(b["total_opens"] for b in box_opens if b["box_volatility"] >= 70)
     high_vol_pct    = round(high_vol_opens / total_box_opens * 100)
     if high_vol_pct >= 60:
-        candidates.append((6, f"**Risk appetite high:** {high_vol_pct}% of box opens were on high-volatility boxes "
+        candidates.append((6, f"*\1* {high_vol_pct}% of box opens were on high-volatility boxes "
                                f"(vol >= 70), weighted avg volatility {round(weighted_vol)}."))
     elif high_vol_pct <= 20:
-        candidates.append((6, f"**Conservative box preference:** Only {high_vol_pct}% of opens on high-volatility boxes, "
+        candidates.append((6, f"*\1* Only {high_vol_pct}% of opens on high-volatility boxes, "
                                f"weighted avg volatility {round(weighted_vol)}."))
 
 # 7. Multi-transaction buyers
 multi_txn = [r for r in top_spenders if r["transactions"] >= 3]
 if multi_txn:
-    candidates.append((7, f"**Repeat buyers:** {len(multi_txn)} user{'s' if len(multi_txn)>1 else ''} made 3+ "
+    candidates.append((7, f"*\1* {len(multi_txn)} user{'s' if len(multi_txn)>1 else ''} made 3+ "
                            f"transactions today, led by user {multi_txn[0]['user_id']} "
                            f"with {multi_txn[0]['transactions']} purchases."))
 
@@ -504,23 +472,23 @@ if by_product:
     top_product     = by_product[0]
     top_prod_pct    = round(float(top_product["revenue_usd"]) / total_rev * 100)
     if top_prod_pct >= 60:
-        candidates.append((6, f"**{clean_slug(top_product['product_slug'])} drove {top_prod_pct}% of revenue:** "
+        candidates.append((6, f"*\1* "
                                f"${float(top_product['revenue_usd']):,.2f} from {top_product['transactions']} transactions."))
 
 # 9. Payer-to-DAU conversion
 if dau > 0:
     conversion = round(total_payers / dau * 100, 1)
     if conversion >= 10:
-        candidates.append((7, f"**Strong conversion:** {total_payers} of {dau} active users paid today "
+        candidates.append((7, f"*\1* {total_payers} of {dau} active users paid today "
                                f"({conversion}% payer conversion rate)."))
     elif conversion <= 2:
-        candidates.append((5, f"**Low conversion:** Only {conversion}% of {dau} active users made a purchase today."))
+        candidates.append((5, f"*\1* Only {conversion}% of {dau} active users made a purchase today."))
 
 # Pick top 3 by priority, deduplicate themes
 candidates.sort(key=lambda x: -x[0])
 obs = [text for _, text in candidates[:3]]
 
-lines += ["", "---", "", "**Observations**"]
+lines += ["", "---", "", "*\1*"]
 for o in obs:
     lines.append(f"- {o}")
 
