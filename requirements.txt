@@ -1,0 +1,4 @@
+google-cloud-bigquery
+db-dtypes
+matplotlib
+slack-sdk
