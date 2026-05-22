@@ -311,111 +311,94 @@ except Exception as e:
     raise
 
 # ── Build Slack message ───────────────────────────────────────────────────────
-def md_row(*cells):
-    return "| " + " | ".join(str(c) for c in cells) + " |"
-
-def md_sep(n):
-    return "| " + " | ".join(["---"] * n) + " |"
+def make_table(headers, rows):
+    str_rows = [[str(c) for c in row] for row in rows]
+    all_rows = [headers] + str_rows
+    widths = [max(len(r[i]) for r in all_rows) for i in range(len(headers))]
+    sep = "  ".join("-" * w for w in widths)
+    out = ["  ".join(h.ljust(w) for h, w in zip(headers, widths)), sep]
+    for row in str_rows:
+        out.append("  ".join(c.ljust(w) for c, w in zip(row, widths)))
+    return "```\n" + "\n".join(out) + "\n```"
 
 lines = [
-    f"## \U0001f4e6 Goatbox Daily Report — {DATE}",
+    f"\U0001f4e6 *Goatbox Daily Report — {DATE}*",
     "",
-    f"**{total_payers}** payers · **{total_txns}** transactions · **${total_rev:,.2f}** revenue · "
-    f"**${avg_spend:,.2f}** avg spend · {coupon_count} coupon transactions · **{dau}** daily active users",
+    f"*{total_payers}* payers  ·  *{total_txns}* transactions  ·  *${total_rev:,.2f}* revenue  ·  "
+    f"*${avg_spend:,.2f}* avg spend  ·  {coupon_count} coupon transactions  ·  *{dau}* daily active users",
     "",
-    "---",
-    "",
-    "**Payer Cohort**",
-    "",
-    f"**{len(new_payers)}** new payers · **{len(return_payers)}** return payers",
+    "*Payer Cohort*",
+    f"*{len(new_payers)}* new payers  ·  *{len(return_payers)}* return payers",
 ]
 
 if return_payers:
     lines += [
         "",
-        md_row("User ID", "Lifetime Purchases", "LTV", "Days Since Last Purchase", "Last Prior Purchase"),
-        md_sep(5),
+        make_table(
+            ["User ID", "Lifetime Purchases", "LTV", "Days Since Last", "Last Prior Purchase"],
+            [(r["user_id"], r["lifetime_purchases"], f"${float(r['lifetime_value_usd']):,.2f}",
+              r["days_since_last_purchase"] if r["days_since_last_purchase"] is not None else "N/A",
+              str(r["last_prior_purchase_date"]) if r["last_prior_purchase_date"] else "N/A")
+             for r in return_payers],
+        ),
     ]
-    for r in return_payers:
-        lines.append(md_row(
-            r["user_id"],
-            r["lifetime_purchases"],
-            f"${float(r['lifetime_value_usd']):,.2f}",
-            r["days_since_last_purchase"] if r["days_since_last_purchase"] is not None else "N/A",
-            str(r["last_prior_purchase_date"]) if r["last_prior_purchase_date"] else "N/A",
-        ))
 
 lines += [
     "",
-    "---",
+    "*Revenue by Store Product*",
     "",
-    "**Revenue by Store Product**",
-    "",
-    md_row("Product", "Payers", "Transactions", "Revenue", "Avg Spend"),
-    md_sep(5),
+    make_table(
+        ["Product", "Payers", "Transactions", "Revenue", "Avg Spend"],
+        [(clean_slug(r["product_slug"]), r["payers"], r["transactions"],
+          f"${float(r['revenue_usd']):,.2f}", f"${float(r['avg_usd']):,.2f}")
+         for r in by_product],
+    ),
 ]
-for r in by_product:
-    lines.append(md_row(
-        clean_slug(r["product_slug"]),
-        r["payers"],
-        r["transactions"],
-        f"${float(r['revenue_usd']):,.2f}",
-        f"${float(r['avg_usd']):,.2f}",
-    ))
 
 lines += [
     "",
-    "---",
+    "*Top Box Opens*",
     "",
-    "**Top Box Opens**",
-    "",
-    md_row("Box", "Volatility", "Opens", "Unique Openers", "Box Price (coins)"),
-    md_sep(5),
+    make_table(
+        ["Box", "Volatility", "Opens", "Unique Openers", "Box Price (coins)"],
+        [(r["box_display_name"], r["box_volatility"], r["total_opens"],
+          r["unique_openers"], r["box_price_coins"])
+         for r in box_opens],
+    ),
 ]
-for r in box_opens:
-    lines.append(md_row(
-        r["box_display_name"],
-        r["box_volatility"],
-        r["total_opens"],
-        r["unique_openers"],
-        r["box_price_coins"],
-    ))
 
 if top_box_name and top_box_users:
     lines += [
         "",
-        "---",
+        f"*Who Opened '{top_box_name}'*",
         "",
-        f"**Who Opened '{top_box_name}'**",
-        "",
-        md_row("User ID", "Opens", "Coins Spent"),
-        md_sep(3),
+        make_table(
+            ["User ID", "Opens", "Coins Spent"],
+            [(r["user_id"], r["opens"], f"{float(r['coins_spent']):,.0f}")
+             for r in top_box_users],
+        ),
     ]
-    for r in top_box_users:
-        lines.append(md_row(r["user_id"], r["opens"], f"{float(r['coins_spent']):,.0f}"))
 
 lines += [
     "",
-    "---",
+    "*Top Openers*",
     "",
-    "**Top Openers**",
+    make_table(
+        ["User ID", "Boxes Opened", "Distinct Boxes", "Coins Spent"],
+        [(r["user_id"], r["total_boxes_opened"], r["distinct_boxes"],
+          f"{int(r['total_coins_spent']):,}")
+         for r in top_openers],
+    ),
     "",
-    md_row("User ID", "Boxes Opened", "Distinct Boxes", "Coins Spent"),
-    md_sep(4),
+    "*Top Spenders*",
+    "",
+    make_table(
+        ["User ID", "Transactions", "Total Spend", "Products"],
+        [(r["user_id"], r["transactions"], f"${float(r['total_spend_usd']):,.2f}",
+          ", ".join(clean_slug(p.strip()) for p in r["products_bought"].split(",")))
+         for r in top_spenders],
+    ),
 ]
-for r in top_openers:
-    lines.append(md_row(r["user_id"], r["total_boxes_opened"], r["distinct_boxes"], f"{int(r['total_coins_spent']):,}"))
-
-lines += [
-    "",
-    "**Top Spenders**",
-    "",
-    md_row("User ID", "Transactions", "Total Spend", "Products"),
-    md_sep(4),
-]
-for r in top_spenders:
-    products = ", ".join(clean_slug(p.strip()) for p in r["products_bought"].split(","))
-    lines.append(md_row(r["user_id"], r["transactions"], f"${float(r['total_spend_usd']):,.2f}", products))
 
 # ── Observations ──────────────────────────────────────────────────────────────
 new_rev   = sum(float(r["lifetime_value_usd"]) for r in new_payers)
@@ -430,22 +413,22 @@ obs = []
 if new_count > 0 and ret_count > 0:
     if pct_new >= 60:
         obs.append(
-            f"**New payer majority:** {new_count} of {total_payers} payers ({pct_new}%) were new, "
+            f"*New payer majority:* {new_count} of {total_payers} payers ({pct_new}%) were new, "
             f"generating ${new_rev:,.2f} in first-time revenue."
         )
     elif ret_count > new_count:
         obs.append(
-            f"**Return payer majority:** {ret_count} of {total_payers} payers ({100-pct_new}%) were returning, "
+            f"*Return payer majority:* {ret_count} of {total_payers} payers ({100-pct_new}%) were returning, "
             f"contributing ${ret_rev:,.2f} in revenue."
         )
     else:
         obs.append(
-            f"**Even cohort split:** {new_count} new vs {ret_count} return payers today."
+            f"*Even cohort split:* {new_count} new vs {ret_count} return payers today."
         )
 elif new_count == total_payers:
-    obs.append(f"**All new payers today:** All {total_payers} payers were first-time buyers, generating ${new_rev:,.2f}.")
+    obs.append(f"*All new payers today:* All {total_payers} payers were first-time buyers, generating ${new_rev:,.2f}.")
 elif ret_count == total_payers:
-    obs.append(f"**All return payers today:** Every payer today was a repeat buyer.")
+    obs.append(f"*All return payers today:* Every payer today was a repeat buyer.")
 
 # Re-engagement gap observation
 if return_payers:
@@ -453,7 +436,7 @@ if return_payers:
     gap = max_gap_user.get("days_since_last_purchase")
     if gap and gap >= 5:
         obs.append(
-            f"**Long re-engagement gap:** User {max_gap_user['user_id']} returned after {gap} days away "
+            f"*Long re-engagement gap:* User {max_gap_user['user_id']} returned after {gap} days away "
             f"with ${float(max_gap_user['lifetime_value_usd']):,.2f} in lifetime value."
         )
 
@@ -464,23 +447,23 @@ if box_opens and top_box_users:
     pct_concentrated = round(top_user_opens / top_box_total * 100) if top_box_total else 0
     if pct_concentrated >= 70:
         obs.append(
-            f"**{top_box_name} dominated by one user:** Single user accounted for "
+            f"*{top_box_name} dominated by one user:* Single user accounted for "
             f"{top_user_opens:,} of {top_box_total:,} opens ({pct_concentrated}%)."
         )
     else:
         obs.append(
-            f"**{top_box_name} was the top box** with {top_box_total:,} opens across "
+            f"*{top_box_name} was the top box* with {top_box_total:,} opens across "
             f"{box_opens[0]['unique_openers']} users."
         )
 
 # Fallback if not enough observations
 while len(obs) < 2:
-    obs.append(f"**Revenue concentration:** Top product ({clean_slug(by_product[0]['product_slug'])}) "
+    obs.append(f"*Revenue concentration:* Top product ({clean_slug(by_product[0]['product_slug'])}) "
                f"drove ${float(by_product[0]['revenue_usd']):,.2f} ({round(float(by_product[0]['revenue_usd'])/total_rev*100)}% of total).")
 
-lines += ["", "---", "", "**Observations**"]
+lines += ["", "*Observations*"]
 for o in obs[:3]:
-    lines.append(f"- {o}")
+    lines.append(f"• {o}")
 
 message = "\n".join(lines)
 
