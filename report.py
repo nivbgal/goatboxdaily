@@ -324,7 +324,7 @@ if return_payers:
     lines.append("")
     for r in return_payers:
         days = r["days_since_last_purchase"]
-        days_str = f"{days} day{‘s’ if days != 1 else ‘’} ago" if days is not None else "N/A"
+        days_str = (f"{days} day" + ("s" if days != 1 else "") + " ago") if days is not None else "N/A"
         lines.append(
             f"• *{r[‘user_id’]}* · ${float(r[‘lifetime_value_usd’]):,.2f} LTV"
             f" · {r[‘lifetime_purchases’]} purchases · last seen {days_str}"
