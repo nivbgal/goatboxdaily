@@ -103,8 +103,8 @@ try:
         SELECT
           b.box_display_name,
           b.box_volatility,
-          COUNT(*)                                                          AS total_opens,
-          COUNT(DISTINCT b.user_id)                                         AS unique_openers,
+          SUM(b.boxes_opened_count)                                          AS total_opens,
+          COUNT(DISTINCT b.user_id)                                          AS unique_openers,
           ROUND(AVG(b.total_coins_spent / NULLIF(b.boxes_opened_count,0)), 2) AS box_price_coins
         FROM `goatbox-prod.processing_data.flat_box_events` b
         INNER JOIN payers p ON b.user_id = p.user_id
