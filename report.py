@@ -1,5 +1,6 @@
 import os
 import io
+import sys
 import datetime
 import matplotlib
 matplotlib.use("Agg")
@@ -27,11 +28,15 @@ bq     = bigquery.Client()
 DATE   = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def q(sql):
-    return [dict(row) for row in bq.query(sql.replace("DATE_FILTER", DATE)).result()]
+def q(sql, params=None):
+    job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
+    return [dict(row) for row in bq.query(sql.replace("DATE_FILTER", DATE), job_config=job_config).result()]
 
 def send_error(msg):
-    slack.chat_postMessage(channel=ERROR_USER_ID, text=f":warning: *Daily report failed ({DATE})*\n{msg}")
+    try:
+        slack.chat_postMessage(channel=ERROR_USER_ID, text=f":warning: *Daily report failed ({DATE})*\n{msg}")
+    except Exception:
+        print(f"[send_error] Slack notification failed. Original error: {msg}", file=sys.stderr)
 
 def fig_to_bytes(fig):
     buf = io.BytesIO()
@@ -196,10 +201,10 @@ try:
             FROM `goatbox-prod.processing_data.flat_box_events` b
             INNER JOIN payers p ON b.user_id = p.user_id
             WHERE DATE(b.event_timestamp) = 'DATE_FILTER'
-              AND b.box_display_name = '{top_box_name}'
+              AND b.box_display_name = @box_name
             GROUP BY b.user_id
             ORDER BY opens DESC
-        """)
+        """, params=[bigquery.ScalarQueryParameter("box_name", "STRING", top_box_name)])
 
 except Exception as e:
     send_error(f"BigQuery query failed:\n```{e}```")
@@ -209,8 +214,8 @@ except Exception as e:
 dau            = dau_row["daily_active_users"]
 total_payers   = summary["total_payers"]
 total_txns     = summary["total_transactions"]
-total_rev      = float(summary["total_revenue_usd"])
-avg_spend      = float(summary["avg_transaction_usd"])
+total_rev      = float(summary["total_revenue_usd"] or 0)
+avg_spend      = float(summary["avg_transaction_usd"] or 0)
 coupon_count   = summary["transactions_with_coupon"]
 
 new_payers     = [r for r in cohort if r["payer_type"] == "new"]
@@ -282,29 +287,30 @@ try:
     charts["users"] = fig_to_bytes(fig)
 
     # Chart 4: Top box table
-    fig, ax = plt.subplots(figsize=(9, max(2.5, len(top_box_users) * 0.5 + 1.8)))
-    ax.axis("off")
-    col_labels = ["User ID", "Opens", "Coins Spent"]
-    table_data = [[r["user_id"], r["opens"], f"{float(r['coins_spent']):,.0f}"] for r in top_box_users]
-    if table_data:
-        tbl = ax.table(cellText=table_data, colLabels=col_labels, cellLoc="left", loc="center", bbox=[0, 0, 1, 1])
-        tbl.auto_set_font_size(False); tbl.set_fontsize(10)
-        for j in range(len(col_labels)):
-            tbl[0, j].set_facecolor(ACCENT)
-            tbl[0, j].set_text_props(color="white", fontweight="bold")
-            tbl[0, j].set_edgecolor(BG)
-        for i in range(1, len(table_data) + 1):
-            row_bg = "#F8F8F8" if i % 2 == 0 else BG
+    if top_box_name:
+        fig, ax = plt.subplots(figsize=(9, max(2.5, len(top_box_users) * 0.5 + 1.8)))
+        ax.axis("off")
+        col_labels = ["User ID", "Opens", "Coins Spent"]
+        table_data = [[r["user_id"], r["opens"], f"{float(r['coins_spent']):,.0f}"] for r in top_box_users]
+        if table_data:
+            tbl = ax.table(cellText=table_data, colLabels=col_labels, cellLoc="left", loc="center", bbox=[0, 0, 1, 1])
+            tbl.auto_set_font_size(False); tbl.set_fontsize(10)
             for j in range(len(col_labels)):
-                tbl[i, j].set_facecolor(row_bg)
-                tbl[i, j].set_edgecolor("#E8E8E8")
-                tbl[i, j].set_text_props(color=TEXT)
-        tbl.auto_set_column_width([0, 1, 2])
-    fig.patch.set_facecolor(BG)
-    ax.set_title(f"Who Opened '{top_box_name}'  -  {DATE}", fontsize=13, fontweight="bold",
-                 color=TEXT, pad=14, loc="left", x=0.01)
-    plt.tight_layout()
-    charts["topbox"] = fig_to_bytes(fig)
+                tbl[0, j].set_facecolor(ACCENT)
+                tbl[0, j].set_text_props(color="white", fontweight="bold")
+                tbl[0, j].set_edgecolor(BG)
+            for i in range(1, len(table_data) + 1):
+                row_bg = "#F8F8F8" if i % 2 == 0 else BG
+                for j in range(len(col_labels)):
+                    tbl[i, j].set_facecolor(row_bg)
+                    tbl[i, j].set_edgecolor("#E8E8E8")
+                    tbl[i, j].set_text_props(color=TEXT)
+            tbl.auto_set_column_width([0, 1, 2])
+        fig.patch.set_facecolor(BG)
+        ax.set_title(f"Who Opened '{top_box_name}'  -  {DATE}", fontsize=13, fontweight="bold",
+                     color=TEXT, pad=14, loc="left", x=0.01)
+        plt.tight_layout()
+        charts["topbox"] = fig_to_bytes(fig)
 
 except Exception as e:
     send_error(f"Chart generation failed:\n```{e}```")
@@ -390,7 +396,7 @@ elif pct_new >= 70:
         f"{new_count} of {total_payers} payers ({pct_new}%) were new, contributing ${new_rev:,.2f} vs ${ret_rev:,.2f} from {ret_count} returning users."))
 elif pct_new <= 30:
     candidates.append((9, "Return payer dominated",
-        f"{ret_count} of {total_payers} payers ({100-pct_new}%) were returning, driving ${ret_rev:,.2f} ({round(ret_rev/total_rev*100)}% of revenue)."))
+        f"{ret_count} of {total_payers} payers ({100-pct_new}%) were returning, driving ${ret_rev:,.2f} ({round(ret_rev/total_rev*100) if total_rev else 0}% of revenue)."))
 else:
     candidates.append((6, "Balanced cohort",
         f"{new_count} new payers (${new_avg:,.2f} avg) vs {ret_count} returning (${ret_avg:,.2f} avg) — "
@@ -411,7 +417,7 @@ if return_payers:
 # 3. Power user spend concentration
 if top_spenders:
     top_spend = float(top_spenders[0]["total_spend_usd"])
-    top_pct   = round(top_spend / total_rev * 100)
+    top_pct   = round(top_spend / total_rev * 100) if total_rev else 0
     if top_pct >= 40:
         candidates.append((8, "Spend concentration",
             f"Top spender (user {top_spenders[0]['user_id']}) accounted for ${top_spend:,.2f} ({top_pct}% of total revenue) across {top_spenders[0]['transactions']} transactions."))
@@ -465,7 +471,7 @@ if multi_txn:
 # 8. Revenue product mix
 if by_product:
     top_product  = by_product[0]
-    top_prod_pct = round(float(top_product["revenue_usd"]) / total_rev * 100)
+    top_prod_pct = round(float(top_product["revenue_usd"]) / total_rev * 100) if total_rev else 0
     if top_prod_pct >= 60:
         candidates.append((6, f"{clean_slug(top_product['product_slug'])} drove {top_prod_pct}% of revenue",
             f"${float(top_product['revenue_usd']):,.2f} from {top_product['transactions']} transactions."))
@@ -497,10 +503,11 @@ try:
     upload_chart(charts["revenue"], f"chart_revenue_{DATE}.png", thread_ts)
     upload_chart(charts["boxes"],   f"chart_boxes_{DATE}.png",   thread_ts)
     upload_chart(charts["users"],   f"chart_users_{DATE}.png",   thread_ts)
-    upload_chart(charts["topbox"],  f"chart_topbox_{DATE}.png",  thread_ts)
+    if "topbox" in charts:
+        upload_chart(charts["topbox"],  f"chart_topbox_{DATE}.png",  thread_ts)
 
     print(f"Report posted: https://secrethumans.slack.com/archives/{CHANNEL_ID}/p{thread_ts.replace('.','')}")
 
-except SlackApiError as e:
+except Exception as e:
     send_error(f"Slack post failed:\n```{e}```")
     raise
