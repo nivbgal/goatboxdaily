@@ -2,7 +2,7 @@ name: Daily Goatbox Report
 
 on:
   schedule:
-    - cron: '0 8 * * *'   # 8:00 AM UTC every day — adjust to taste
+    - cron: '0 5 * * *'   # 5:00 AM UTC every day — covers full previous calendar day
   workflow_dispatch:       # lets you trigger it manually from GitHub too
 
 jobs:
