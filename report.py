@@ -166,7 +166,8 @@ try:
             MAX(IF(DATE(p.event_timestamp) < 'DATE_FILTER', p.event_timestamp, NULL)) AS last_prior_purchase_ts,
             COUNTIF(DATE(p.event_timestamp) < 'DATE_FILTER')                          AS prior_purchases,
             COUNT(*)                                                                    AS lifetime_purchases,
-            ROUND(SUM(p.amount_usd), 2)                                                AS lifetime_value_usd
+            ROUND(SUM(p.amount_usd), 2)                                                AS lifetime_value_usd,
+            ROUND(SUM(IF(DATE(p.event_timestamp) = 'DATE_FILTER', p.amount_usd, 0)), 2) AS today_revenue_usd
           FROM `goatbox-prod.processing_data.flat_purchase_events` p
           INNER JOIN today_payers t ON p.user_id = t.user_id
           WHERE DATE(p.event_timestamp) <= 'DATE_FILTER'
@@ -377,8 +378,8 @@ for r in top_spenders:
 new_count  = len(new_payers)
 ret_count  = len(return_payers)
 pct_new    = round(new_count / total_payers * 100) if total_payers else 0
-new_rev    = sum(float(r["lifetime_value_usd"]) for r in new_payers)
-ret_rev    = sum(float(r["lifetime_value_usd"]) for r in return_payers)
+new_rev    = sum(float(r["today_revenue_usd"]) for r in new_payers)
+ret_rev    = sum(float(r["today_revenue_usd"]) for r in return_payers)
 new_avg    = new_rev / new_count if new_count else 0
 ret_avg    = ret_rev / ret_count if ret_count else 0
 
