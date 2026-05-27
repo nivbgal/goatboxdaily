@@ -546,7 +546,8 @@ try:
     if "topbox" in charts:
         upload_chart(charts["topbox"],  f"chart_topbox_{DATE}.png",  thread_ts)
 
-    print(f"Report posted: https://secrethumans.slack.com/archives/{CHANNEL_ID}/p{thread_ts.replace('.','')}").
+    print(f"Report posted: https://secrethumans.slack.com/archives/{CHANNEL_ID}/p{thread_ts.replace('.','')}",
+          flush=True)
 
 except Exception as e:
     send_error(f"Slack post failed:\n```{e}```")
