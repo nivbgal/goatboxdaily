@@ -65,14 +65,15 @@ def upload_chart(buf, filename, thread_ts):
 
 # ── Queries ───────────────────────────────────────────────────────────────────
 try:
-    dau_row = q(f"""
+    dau_rows = q(f"""
         SELECT COUNT(DISTINCT user_id) AS daily_active_users
         FROM `goatbox-prod.processing_data.flat_login_events`
         WHERE DATE(event_timestamp) = 'DATE_FILTER'
           AND user_id NOT IN ({EXCLUDED})
-    """)[0]
+    """)
+    dau_row = dau_rows[0] if dau_rows else {"daily_active_users": 0}
 
-    summary = q(f"""
+    summary_rows = q(f"""
         SELECT
           COUNT(DISTINCT user_id)               AS total_payers,
           COUNT(*)                               AS total_transactions,
@@ -82,7 +83,12 @@ try:
         FROM `goatbox-prod.processing_data.flat_purchase_events`
         WHERE DATE(event_timestamp) = 'DATE_FILTER'
           AND user_id NOT IN ({EXCLUDED})
-    """)[0]
+    """)
+    summary = summary_rows[0] if summary_rows else {
+        "total_payers": 0, "total_transactions": 0,
+        "total_revenue_usd": 0, "avg_transaction_usd": 0,
+        "transactions_with_coupon": 0
+    }
 
     by_product = q(f"""
         SELECT
@@ -230,65 +236,78 @@ try:
     charts = {}
 
     # Chart 1: Revenue by product
-    labels_rev = [clean_slug(r["product_slug"]) for r in by_product][::-1]
-    values_rev = [float(r["revenue_usd"]) for r in by_product][::-1]
-    fig, ax = plt.subplots(figsize=(7, max(3, len(labels_rev) * 0.55 + 1)))
-    bars = ax.barh(labels_rev, values_rev, color=ACCENT, height=0.6)
-    for bar, val in zip(bars, values_rev):
-        ax.text(bar.get_width() + max(values_rev) * 0.01, bar.get_y() + bar.get_height() / 2,
-                f"${val:,.2f}", va="center", ha="left", fontsize=10, color=TEXT)
-    ax.set_xlabel("Revenue (USD)", color=MUTED, fontsize=10)
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
-    base_style(ax, f"Revenue by Store Product  -  {DATE}")
-    plt.tight_layout()
-    charts["revenue"] = fig_to_bytes(fig)
+    if by_product:
+        labels_rev = [clean_slug(r["product_slug"]) for r in by_product][::-1]
+        values_rev = [float(r["revenue_usd"]) for r in by_product][::-1]
+        max_rev = max(values_rev) if values_rev else 1
+        fig, ax = plt.subplots(figsize=(7, max(3, len(labels_rev) * 0.55 + 1)))
+        bars = ax.barh(labels_rev, values_rev, color=ACCENT, height=0.6)
+        for bar, val in zip(bars, values_rev):
+            ax.text(bar.get_width() + max_rev * 0.01, bar.get_y() + bar.get_height() / 2,
+                    f"${val:,.2f}", va="center", ha="left", fontsize=10, color=TEXT)
+        ax.set_xlabel("Revenue (USD)", color=MUTED, fontsize=10)
+        ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+        base_style(ax, f"Revenue by Store Product  -  {DATE}")
+        plt.tight_layout()
+        charts["revenue"] = fig_to_bytes(fig)
 
     # Chart 2: Box opens
-    labels_box  = [b["box_display_name"] for b in box_opens][::-1]
-    opens       = [b["total_opens"] for b in box_opens][::-1]
-    unique      = [b["unique_openers"] for b in box_opens][::-1]
-    volatility  = [b["box_volatility"] for b in box_opens][::-1]
-    norm = plt.Normalize(0, 100); cmap = plt.cm.RdYlBu_r
-    colors_box = [cmap(norm(v)) for v in volatility]
-    fig, ax = plt.subplots(figsize=(8, max(4, len(labels_box) * 0.6 + 1.2)))
-    bars = ax.barh(labels_box, opens, color=colors_box, height=0.6)
-    for bar, o, u in zip(bars, opens, unique):
-        ax.text(bar.get_width() + max(opens) * 0.01, bar.get_y() + bar.get_height() / 2,
-                f"{o} opens, {u} user{'s' if u != 1 else ''}", va="center", ha="left", fontsize=9, color=TEXT)
-    ax.set_xlabel("Box Opens", color=MUTED, fontsize=10)
-    base_style(ax, f"Top Box Opens by Paying Users  -  {DATE}")
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
-    cbar = plt.colorbar(sm, ax=ax, orientation="vertical", fraction=0.02, pad=0.12)
-    cbar.set_label("Volatility", color=MUTED, fontsize=9); cbar.ax.tick_params(labelsize=8, colors=MUTED)
-    plt.tight_layout()
-    charts["boxes"] = fig_to_bytes(fig)
+    if box_opens:
+        labels_box  = [b["box_display_name"] for b in box_opens][::-1]
+        opens       = [b["total_opens"] for b in box_opens][::-1]
+        unique      = [b["unique_openers"] for b in box_opens][::-1]
+        volatility  = [b["box_volatility"] for b in box_opens][::-1]
+        max_opens = max(opens) if opens else 1
+        norm = plt.Normalize(0, 100); cmap = plt.cm.RdYlBu_r
+        colors_box = [cmap(norm(v)) for v in volatility]
+        fig, ax = plt.subplots(figsize=(8, max(4, len(labels_box) * 0.6 + 1.2)))
+        bars = ax.barh(labels_box, opens, color=colors_box, height=0.6)
+        for bar, o, u in zip(bars, opens, unique):
+            ax.text(bar.get_width() + max_opens * 0.01, bar.get_y() + bar.get_height() / 2,
+                    f"{o} opens, {u} user{'s' if u != 1 else ''}", va="center", ha="left", fontsize=9, color=TEXT)
+        ax.set_xlabel("Box Opens", color=MUTED, fontsize=10)
+        base_style(ax, f"Top Box Opens by Paying Users  -  {DATE}")
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
+        cbar = plt.colorbar(sm, ax=ax, orientation="vertical", fraction=0.02, pad=0.12)
+        cbar.set_label("Volatility", color=MUTED, fontsize=9); cbar.ax.tick_params(labelsize=8, colors=MUTED)
+        plt.tight_layout()
+        charts["boxes"] = fig_to_bytes(fig)
 
     # Chart 3: Top users
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, max(3, len(top_openers) * 0.65 + 1.5)))
-    if top_openers:
-        lo = [r["user_id"] for r in top_openers][::-1]
-        vo = [int(r["total_boxes_opened"]) for r in top_openers][::-1]
-        ax1.barh(lo, vo, color="#36C5F0", height=0.6)
-        for i, v in enumerate(vo):
-            ax1.text(v + max(vo) * 0.01, i, str(v), va="center", fontsize=10, color=TEXT)
-        ax1.set_xlabel("Boxes Opened", color=MUTED, fontsize=10)
-        ax1.tick_params(axis="y", labelsize=7)
-        base_style(ax1, "Top Openers")
-    if top_spenders:
-        ls = [r["user_id"] for r in top_spenders][::-1]
-        vs = [float(r["total_spend_usd"]) for r in top_spenders][::-1]
-        ax2.barh(ls, vs, color="#2EB67D", height=0.6)
-        for i, v in enumerate(vs):
-            ax2.text(v + max(vs) * 0.01, i, f"${v:,.2f}", va="center", fontsize=10, color=TEXT)
-        ax2.set_xlabel("Total Spend (USD)", color=MUTED, fontsize=10)
-        ax2.tick_params(axis="y", labelsize=7)
-        base_style(ax2, "Top Spenders")
-    fig.suptitle(f"Top Users  -  {DATE}", fontsize=13, fontweight="bold", color=TEXT, x=0.02, ha="left")
-    plt.tight_layout()
-    charts["users"] = fig_to_bytes(fig)
+    if top_openers or top_spenders:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, max(3, max(len(top_openers), len(top_spenders), 1) * 0.65 + 1.5)))
+        if top_openers:
+            lo = [r["user_id"] for r in top_openers][::-1]
+            vo = [int(r["total_boxes_opened"]) for r in top_openers][::-1]
+            max_vo = max(vo) if vo else 1
+            ax1.barh(lo, vo, color="#36C5F0", height=0.6)
+            for i, v in enumerate(vo):
+                ax1.text(v + max_vo * 0.01, i, str(v), va="center", fontsize=10, color=TEXT)
+            ax1.set_xlabel("Boxes Opened", color=MUTED, fontsize=10)
+            ax1.tick_params(axis="y", labelsize=7)
+            base_style(ax1, "Top Openers")
+        else:
+            ax1.axis("off")
+            ax1.text(0.5, 0.5, "No data", ha="center", va="center", color=MUTED, transform=ax1.transAxes)
+        if top_spenders:
+            ls = [r["user_id"] for r in top_spenders][::-1]
+            vs = [float(r["total_spend_usd"]) for r in top_spenders][::-1]
+            max_vs = max(vs) if vs else 1
+            ax2.barh(ls, vs, color="#2EB67D", height=0.6)
+            for i, v in enumerate(vs):
+                ax2.text(v + max_vs * 0.01, i, f"${v:,.2f}", va="center", fontsize=10, color=TEXT)
+            ax2.set_xlabel("Total Spend (USD)", color=MUTED, fontsize=10)
+            ax2.tick_params(axis="y", labelsize=7)
+            base_style(ax2, "Top Spenders")
+        else:
+            ax2.axis("off")
+            ax2.text(0.5, 0.5, "No data", ha="center", va="center", color=MUTED, transform=ax2.transAxes)
+        fig.suptitle(f"Top Users  -  {DATE}", fontsize=13, fontweight="bold", color=TEXT, x=0.02, ha="left")
+        plt.tight_layout()
+        charts["users"] = fig_to_bytes(fig)
 
     # Chart 4: Top box table
-    if top_box_name:
+    if top_box_name and top_box_users:
         fig, ax = plt.subplots(figsize=(9, max(2.5, len(top_box_users) * 0.5 + 1.8)))
         ax.axis("off")
         col_labels = ["User ID", "Opens", "Coins Spent"]
@@ -339,18 +358,24 @@ if return_payers:
 
 # Revenue by product
 lines += ["", "*Revenue by Store Product*", ""]
-for r in by_product:
-    lines.append(
-        f"• *{clean_slug(r['product_slug'])}* · ${float(r['revenue_usd']):,.2f} · {r['transactions']} txns"
-    )
+if by_product:
+    for r in by_product:
+        lines.append(
+            f"• *{clean_slug(r['product_slug'])}* · ${float(r['revenue_usd']):,.2f} · {r['transactions']} txns"
+        )
+else:
+    lines.append("• No purchases recorded today")
 
 # Top box opens
 lines += ["", "*Top Box Opens*", ""]
-for r in box_opens:
-    lines.append(
-        f"• *{r['box_display_name']}* · {r['total_opens']} opens"
-        f" · {r['unique_openers']} users · vol {r['box_volatility']}"
-    )
+if box_opens:
+    for r in box_opens:
+        lines.append(
+            f"• *{r['box_display_name']}* · {r['total_opens']} opens"
+            f" · {r['unique_openers']} users · vol {r['box_volatility']}"
+        )
+else:
+    lines.append("• No box opens by paying users today")
 
 # Who opened top box
 if top_box_name and top_box_users:
@@ -362,17 +387,23 @@ if top_box_name and top_box_users:
 
 # Top openers
 lines += ["", "*Top Openers*", ""]
-for r in top_openers:
-    lines.append(
-        f"• *{r['user_id']}* · {r['total_boxes_opened']:,} opens · {r['distinct_boxes']} boxes"
-    )
+if top_openers:
+    for r in top_openers:
+        lines.append(
+            f"• *{r['user_id']}* · {r['total_boxes_opened']:,} opens · {r['distinct_boxes']} boxes"
+        )
+else:
+    lines.append("• No data")
 
 # Top spenders
 lines += ["", "*Top Spenders*", ""]
-for r in top_spenders:
-    lines.append(
-        f"• *{r['user_id']}* · ${float(r['total_spend_usd']):,.2f} · {r['transactions']} txns"
-    )
+if top_spenders:
+    for r in top_spenders:
+        lines.append(
+            f"• *{r['user_id']}* · ${float(r['total_spend_usd']):,.2f} · {r['transactions']} txns"
+        )
+else:
+    lines.append("• No data")
 
 # ── Observations (rule-based, multi-signal) ───────────────────────────────────
 new_count  = len(new_payers)
@@ -385,107 +416,112 @@ ret_avg    = ret_rev / ret_count if ret_count else 0
 
 candidates = []  # (priority, label, detail)
 
-# 1. Cohort split
-if new_count == total_payers:
-    candidates.append((10, "All new payers",
-        f"Every payer today was a first-time buyer. {new_count} new users generated ${new_rev:,.2f} at ${new_avg:,.2f} avg."))
-elif ret_count == total_payers:
-    candidates.append((10, "All return payers",
-        f"No new buyers today. {ret_count} returning users generated ${ret_rev:,.2f} at ${ret_avg:,.2f} avg."))
-elif pct_new >= 70:
-    candidates.append((9, "Heavy new payer skew",
-        f"{new_count} of {total_payers} payers ({pct_new}%) were new, contributing ${new_rev:,.2f} vs ${ret_rev:,.2f} from {ret_count} returning users."))
-elif pct_new <= 30:
-    candidates.append((9, "Return payer dominated",
-        f"{ret_count} of {total_payers} payers ({100-pct_new}%) were returning, driving ${ret_rev:,.2f} ({round(ret_rev/total_rev*100) if total_rev else 0}% of revenue)."))
+if total_payers == 0:
+    candidates.append((10, "No payers today",
+        f"Zero purchase transactions were recorded for {DATE}."))
 else:
-    candidates.append((6, "Balanced cohort",
-        f"{new_count} new payers (${new_avg:,.2f} avg) vs {ret_count} returning (${ret_avg:,.2f} avg) — "
-        f"{'returners spent more per head' if ret_avg > new_avg else 'new users spent more per head'}."))
+    # 1. Cohort split
+    if new_count == total_payers:
+        candidates.append((10, "All new payers",
+            f"Every payer today was a first-time buyer. {new_count} new users generated ${new_rev:,.2f} at ${new_avg:,.2f} avg."))
+    elif ret_count == total_payers:
+        candidates.append((10, "All return payers",
+            f"No new buyers today. {ret_count} returning users generated ${ret_rev:,.2f} at ${ret_avg:,.2f} avg."))
+    elif pct_new >= 70:
+        candidates.append((9, "Heavy new payer skew",
+            f"{new_count} of {total_payers} payers ({pct_new}%) were new, contributing ${new_rev:,.2f} vs ${ret_rev:,.2f} from {ret_count} returning users."))
+    elif pct_new <= 30:
+        candidates.append((9, "Return payer dominated",
+            f"{ret_count} of {total_payers} payers ({100-pct_new}%) were returning, driving ${ret_rev:,.2f} ({round(ret_rev/total_rev*100) if total_rev else 0}% of revenue)."))
+    else:
+        candidates.append((6, "Balanced cohort",
+            f"{new_count} new payers (${new_avg:,.2f} avg) vs {ret_count} returning (${ret_avg:,.2f} avg) — "
+            f"{'returners spent more per head' if ret_avg > new_avg else 'new users spent more per head'}."))
 
-# 2. Return payer re-engagement gap
-if return_payers:
-    gaps = [(r["days_since_last_purchase"], r) for r in return_payers if r.get("days_since_last_purchase")]
-    if gaps:
-        max_gap, max_gap_user = max(gaps, key=lambda x: x[0])
-        if max_gap >= 14:
-            candidates.append((9, "Long re-engagement",
-                f"User {max_gap_user['user_id']} returned after {max_gap} days away with ${float(max_gap_user['lifetime_value_usd']):,.2f} LTV across {max_gap_user['lifetime_purchases']} lifetime purchases."))
-        elif max_gap >= 5:
-            candidates.append((7, "Re-engagement gap",
-                f"Top returning user came back after {max_gap} days (${float(max_gap_user['lifetime_value_usd']):,.2f} LTV)."))
+    # 2. Return payer re-engagement gap
+    if return_payers:
+        gaps = [(r["days_since_last_purchase"], r) for r in return_payers if r.get("days_since_last_purchase")]
+        if gaps:
+            max_gap, max_gap_user = max(gaps, key=lambda x: x[0])
+            if max_gap >= 14:
+                candidates.append((9, "Long re-engagement",
+                    f"User {max_gap_user['user_id']} returned after {max_gap} days away with ${float(max_gap_user['lifetime_value_usd']):,.2f} LTV across {max_gap_user['lifetime_purchases']} lifetime purchases."))
+            elif max_gap >= 5:
+                candidates.append((7, "Re-engagement gap",
+                    f"Top returning user came back after {max_gap} days (${float(max_gap_user['lifetime_value_usd']):,.2f} LTV)."))
 
-# 3. Power user spend concentration
-if top_spenders:
-    top_spend = float(top_spenders[0]["total_spend_usd"])
-    top_pct   = round(top_spend / total_rev * 100) if total_rev else 0
-    if top_pct >= 40:
-        candidates.append((8, "Spend concentration",
-            f"Top spender (user {top_spenders[0]['user_id']}) accounted for ${top_spend:,.2f} ({top_pct}% of total revenue) across {top_spenders[0]['transactions']} transactions."))
-    elif top_pct >= 25:
-        candidates.append((6, f"Top spender drove {top_pct}% of revenue",
-            f"${top_spend:,.2f} from user {top_spenders[0]['user_id']}."))
+    # 3. Power user spend concentration
+    if top_spenders and total_rev > 0:
+        top_spend = float(top_spenders[0]["total_spend_usd"])
+        top_pct   = round(top_spend / total_rev * 100)
+        if top_pct >= 40:
+            candidates.append((8, "Spend concentration",
+                f"Top spender (user {top_spenders[0]['user_id']}) accounted for ${top_spend:,.2f} ({top_pct}% of total revenue) across {top_spenders[0]['transactions']} transactions."))
+        elif top_pct >= 25:
+            candidates.append((6, f"Top spender drove {top_pct}% of revenue",
+                f"${top_spend:,.2f} from user {top_spenders[0]['user_id']}."))
 
-# 4. Box opens concentration
-if box_opens and top_box_users:
-    total_opens_all = sum(b["total_opens"] for b in box_opens)
-    top_box_opens   = box_opens[0]["total_opens"]
-    top_box_pct     = round(top_box_opens / total_opens_all * 100)
-    top_user_opens  = top_box_users[0]["opens"]
-    top_user_pct    = round(top_user_opens / top_box_opens * 100)
-    if top_user_pct >= 80:
-        candidates.append((8, f"{top_box_name} monopolised",
-            f"One user opened {top_user_opens:,} of {top_box_opens:,} {top_box_name} boxes ({top_user_pct}%)."))
-    elif top_box_pct >= 50:
-        candidates.append((7, f"{top_box_name} dominates opens",
-            f"{top_box_opens:,} opens ({top_box_pct}% of all {total_opens_all:,}) across {box_opens[0]['unique_openers']} users."))
+    # 4. Box opens concentration
+    if box_opens and top_box_users:
+        total_opens_all = sum(b["total_opens"] for b in box_opens)
+        top_box_opens   = box_opens[0]["total_opens"]
+        top_box_pct     = round(top_box_opens / total_opens_all * 100) if total_opens_all else 0
+        top_user_opens  = top_box_users[0]["opens"]
+        top_user_pct    = round(top_user_opens / top_box_opens * 100) if top_box_opens else 0
+        if top_user_pct >= 80:
+            candidates.append((8, f"{top_box_name} monopolised",
+                f"One user opened {top_user_opens:,} of {top_box_opens:,} {top_box_name} boxes ({top_user_pct}%)."))
+        elif top_box_pct >= 50:
+            candidates.append((7, f"{top_box_name} dominates opens",
+                f"{top_box_opens:,} opens ({top_box_pct}% of all {total_opens_all:,}) across {box_opens[0]['unique_openers']} users."))
 
-# 5. Coupon usage rate
-if total_txns > 0:
-    coupon_pct = round(coupon_count / total_txns * 100)
-    if coupon_pct >= 40:
-        candidates.append((7, "High coupon usage",
-            f"{coupon_count} of {total_txns} transactions ({coupon_pct}%) used a coupon code, suggesting active discount-driven purchasing."))
-    elif coupon_pct == 0 and total_txns >= 5:
-        candidates.append((5, "No coupons today",
-            f"All {total_txns} transactions were full price."))
+    # 5. Coupon usage rate
+    if total_txns > 0:
+        coupon_pct = round(coupon_count / total_txns * 100)
+        if coupon_pct >= 40:
+            candidates.append((7, "High coupon usage",
+                f"{coupon_count} of {total_txns} transactions ({coupon_pct}%) used a coupon code, suggesting active discount-driven purchasing."))
+        elif coupon_pct == 0 and total_txns >= 5:
+            candidates.append((5, "No coupons today",
+                f"All {total_txns} transactions were full price."))
 
-# 6. Box volatility preference
-if box_opens:
-    total_box_opens = sum(b["total_opens"] for b in box_opens)
-    weighted_vol    = sum(b["box_volatility"] * b["total_opens"] for b in box_opens) / total_box_opens
-    high_vol_opens  = sum(b["total_opens"] for b in box_opens if b["box_volatility"] >= 70)
-    high_vol_pct    = round(high_vol_opens / total_box_opens * 100)
-    if high_vol_pct >= 60:
-        candidates.append((6, "Risk appetite high",
-            f"{high_vol_pct}% of box opens were on high-volatility boxes (vol >= 70), weighted avg volatility {round(weighted_vol)}."))
-    elif high_vol_pct <= 20:
-        candidates.append((6, "Conservative box preference",
-            f"Only {high_vol_pct}% of opens on high-volatility boxes, weighted avg volatility {round(weighted_vol)}."))
+    # 6. Box volatility preference
+    if box_opens:
+        total_box_opens = sum(b["total_opens"] for b in box_opens)
+        if total_box_opens > 0:
+            weighted_vol    = sum(b["box_volatility"] * b["total_opens"] for b in box_opens) / total_box_opens
+            high_vol_opens  = sum(b["total_opens"] for b in box_opens if b["box_volatility"] >= 70)
+            high_vol_pct    = round(high_vol_opens / total_box_opens * 100)
+            if high_vol_pct >= 60:
+                candidates.append((6, "Risk appetite high",
+                    f"{high_vol_pct}% of box opens were on high-volatility boxes (vol >= 70), weighted avg volatility {round(weighted_vol)}."))
+            elif high_vol_pct <= 20:
+                candidates.append((6, "Conservative box preference",
+                    f"Only {high_vol_pct}% of opens on high-volatility boxes, weighted avg volatility {round(weighted_vol)}."))
 
-# 7. Multi-transaction buyers
-multi_txn = [r for r in top_spenders if r["transactions"] >= 3]
-if multi_txn:
-    candidates.append((7, "Repeat buyers",
-        f"{len(multi_txn)} user{'s' if len(multi_txn) > 1 else ''} made 3+ transactions today, led by user {multi_txn[0]['user_id']} with {multi_txn[0]['transactions']} purchases."))
+    # 7. Multi-transaction buyers
+    multi_txn = [r for r in top_spenders if r["transactions"] >= 3]
+    if multi_txn:
+        candidates.append((7, "Repeat buyers",
+            f"{len(multi_txn)} user{'s' if len(multi_txn) > 1 else ''} made 3+ transactions today, led by user {multi_txn[0]['user_id']} with {multi_txn[0]['transactions']} purchases."))
 
-# 8. Revenue product mix
-if by_product:
-    top_product  = by_product[0]
-    top_prod_pct = round(float(top_product["revenue_usd"]) / total_rev * 100) if total_rev else 0
-    if top_prod_pct >= 60:
-        candidates.append((6, f"{clean_slug(top_product['product_slug'])} drove {top_prod_pct}% of revenue",
-            f"${float(top_product['revenue_usd']):,.2f} from {top_product['transactions']} transactions."))
+    # 8. Revenue product mix
+    if by_product and total_rev > 0:
+        top_product  = by_product[0]
+        top_prod_pct = round(float(top_product["revenue_usd"]) / total_rev * 100)
+        if top_prod_pct >= 60:
+            candidates.append((6, f"{clean_slug(top_product['product_slug'])} drove {top_prod_pct}% of revenue",
+                f"${float(top_product['revenue_usd']):,.2f} from {top_product['transactions']} transactions."))
 
-# 9. Payer-to-DAU conversion
-if dau > 0:
-    conversion = round(total_payers / dau * 100, 1)
-    if conversion >= 10:
-        candidates.append((7, "Strong conversion",
-            f"{total_payers} of {dau} active users paid today ({conversion}% payer conversion rate)."))
-    elif conversion <= 2:
-        candidates.append((5, "Low conversion",
-            f"Only {conversion}% of {dau} active users made a purchase today."))
+    # 9. Payer-to-DAU conversion
+    if dau > 0:
+        conversion = round(total_payers / dau * 100, 1)
+        if conversion >= 10:
+            candidates.append((7, "Strong conversion",
+                f"{total_payers} of {dau} active users paid today ({conversion}% payer conversion rate)."))
+        elif conversion <= 2:
+            candidates.append((5, "Low conversion",
+                f"Only {conversion}% of {dau} active users made a purchase today."))
 
 candidates.sort(key=lambda x: -x[0])
 top_obs = candidates[:3]
@@ -501,13 +537,16 @@ try:
     resp = slack.chat_postMessage(channel=CHANNEL_ID, text=message)
     thread_ts = resp["ts"]
 
-    upload_chart(charts["revenue"], f"chart_revenue_{DATE}.png", thread_ts)
-    upload_chart(charts["boxes"],   f"chart_boxes_{DATE}.png",   thread_ts)
-    upload_chart(charts["users"],   f"chart_users_{DATE}.png",   thread_ts)
+    if "revenue" in charts:
+        upload_chart(charts["revenue"], f"chart_revenue_{DATE}.png", thread_ts)
+    if "boxes" in charts:
+        upload_chart(charts["boxes"],   f"chart_boxes_{DATE}.png",   thread_ts)
+    if "users" in charts:
+        upload_chart(charts["users"],   f"chart_users_{DATE}.png",   thread_ts)
     if "topbox" in charts:
         upload_chart(charts["topbox"],  f"chart_topbox_{DATE}.png",  thread_ts)
 
-    print(f"Report posted: https://secrethumans.slack.com/archives/{CHANNEL_ID}/p{thread_ts.replace('.','')}")
+    print(f"Report posted: https://secrethumans.slack.com/archives/{CHANNEL_ID}/p{thread_ts.replace('.','')}").
 
 except Exception as e:
     send_error(f"Slack post failed:\n```{e}```")
