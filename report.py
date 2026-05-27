@@ -184,6 +184,7 @@ try:
           CASE WHEN prior_purchases = 0 THEN 'new' ELSE 'return' END AS payer_type,
           lifetime_purchases,
           lifetime_value_usd,
+          today_revenue_usd,
           DATE(last_prior_purchase_ts)                                AS last_prior_purchase_date,
           DATE_DIFF(DATE 'DATE_FILTER', DATE(last_prior_purchase_ts), DAY) AS days_since_last_purchase
         FROM all_history
@@ -409,8 +410,8 @@ else:
 new_count  = len(new_payers)
 ret_count  = len(return_payers)
 pct_new    = round(new_count / total_payers * 100) if total_payers else 0
-new_rev    = sum(float(r["today_revenue_usd"]) for r in new_payers)
-ret_rev    = sum(float(r["today_revenue_usd"]) for r in return_payers)
+new_rev    = sum(float(r.get("today_revenue_usd") or 0) for r in new_payers)
+ret_rev    = sum(float(r.get("today_revenue_usd") or 0) for r in return_payers)
 new_avg    = new_rev / new_count if new_count else 0
 ret_avg    = ret_rev / ret_count if ret_count else 0
 
