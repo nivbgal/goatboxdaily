@@ -230,6 +230,18 @@ coupon_count   = summary["transactions_with_coupon"]
 new_payers     = [r for r in cohort if r["payer_type"] == "new"]
 return_payers  = [r for r in cohort if r["payer_type"] == "return"]
 
+new_count    = len(new_payers)
+ret_count    = len(return_payers)
+pct_new      = round(new_count / total_payers * 100) if total_payers else 0
+pct_ret      = 100 - pct_new
+new_rev      = sum(float(r.get("today_revenue_usd") or 0) for r in new_payers)
+ret_rev      = sum(float(r.get("today_revenue_usd") or 0) for r in return_payers)
+new_avg      = new_rev / new_count if new_count else 0
+ret_avg      = ret_rev / ret_count if ret_count else 0
+new_rev_pct  = round(new_rev / total_rev * 100) if total_rev else 0
+ret_rev_pct  = round(ret_rev / total_rev * 100) if total_rev else 0
+arppu        = total_rev / total_payers if total_payers else 0
+
 def clean_slug(s):
     return s.replace("-shop-item", "").replace("-", " ").title()
 
@@ -343,11 +355,15 @@ lines = [
     f"\U0001f4e6 *Goatbox Daily Report — {DATE}*",
     "",
     f"*{total_payers}* payers  ·  *{total_txns}* transactions  ·  *${total_rev:,.2f}* revenue  ·  "
-    f"*${avg_spend:,.2f}* avg spend  ·  {coupon_count} coupon transactions  ·  *{dau}* daily active users",
+    f"*${arppu:,.2f}* ARPPU  ·  *${avg_spend:,.2f}* avg/txn  ·  {coupon_count} coupon txns  ·  *{dau}* DAU",
 ]
 
 # Payer cohort
-lines += ["", f"*Payer Cohort* — *{len(new_payers)}* new  ·  *{len(return_payers)}* returning"]
+lines += [
+    "",
+    f"*Payer Cohort* — *{new_count}* new (*{pct_new}%*) · *{ret_count}* returning (*{pct_ret}%*)",
+    f"New rev: *${new_rev:,.2f}* (*{new_rev_pct}%*) · Returning rev: *${ret_rev:,.2f}* (*{ret_rev_pct}%*)"
+]
 if return_payers:
     lines.append("")
     for r in return_payers:
@@ -408,14 +424,6 @@ else:
     lines.append("• No data")
 
 # ── Observations (rule-based, multi-signal) ───────────────────────────────────
-new_count  = len(new_payers)
-ret_count  = len(return_payers)
-pct_new    = round(new_count / total_payers * 100) if total_payers else 0
-new_rev    = sum(float(r.get("today_revenue_usd") or 0) for r in new_payers)
-ret_rev    = sum(float(r.get("today_revenue_usd") or 0) for r in return_payers)
-new_avg    = new_rev / new_count if new_count else 0
-ret_avg    = ret_rev / ret_count if ret_count else 0
-
 candidates = []  # (priority, label, detail)
 
 if total_payers == 0:
