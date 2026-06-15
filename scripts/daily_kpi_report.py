@@ -20,6 +20,7 @@ from slack_sdk.errors import SlackApiError
 # ── Config ────────────────────────────────────────────────────────────────────
 SLACK_CHANNEL     = "C0B3KS5KNTC"   # #daily-report-claude
 SLACK_VIP_CHANNEL = "C0BAJM1T8LE"   # #vip
+ERROR_USER_ID     = "U0B0ZF5D6F9"   # niv — receives error DMs
 CAMPAIGN_START = datetime(2026, 5, 10, tzinfo=timezone.utc)
 CAMPAIGN_END   = datetime(2026, 8,  7, tzinfo=timezone.utc)
 
@@ -167,6 +168,13 @@ ORDER BY user_id, rn
 """
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+def send_error_dm(client: "WebClient", msg: str) -> None:
+    try:
+        client.chat_postMessage(channel=ERROR_USER_ID, text=f"🚨 daily_kpi_report error:\n{msg}")
+    except Exception:
+        pass  # don't let the DM failure mask the original error
+
+
 def run_query(bq: bigquery.Client, sql: str) -> list[dict]:
     rows = list(bq.query(sql).result())
     return [dict(r) for r in rows]
@@ -380,6 +388,8 @@ def main():
         print("ERROR: SLACK_BOT_TOKEN not set", file=sys.stderr)
         sys.exit(1)
 
+    client = WebClient(token=slack_token)
+
     print("Connecting to BigQuery...")
     bq = bigquery.Client()
 
@@ -391,15 +401,15 @@ def main():
         vip_rows      = run_query(bq, Q_VIP_NEW)
         purchase_rows = run_query(bq, Q_VIP_PURCHASES) if vip_rows else []
     except Exception as e:
-        print(f"BigQuery error: {e}", file=sys.stderr)
+        msg = f"BigQuery error: {e}"
+        print(msg, file=sys.stderr)
+        send_error_dm(client, msg)
         sys.exit(1)
 
     print(f"  FTD rows:      {len(ftd_rows)}")
     print(f"  ARPU rows:     {len(arpu_rows)}")
     print(f"  Ret rows:      {len(ret_rows)}")
     print(f"  New VIP rows:  {len(vip_rows)}")
-
-    client = WebClient(token=slack_token)
 
     # ── Post main KPI report to #daily-report-claude ──────────────────────────
     blocks = build_blocks(ftd_rows, arpu_rows, ret_rows)
@@ -414,7 +424,9 @@ def main():
         )
         print(f"KPI report posted. ts={resp['ts']}")
     except SlackApiError as e:
-        print(f"Slack error (KPI): {e.response['error']}", file=sys.stderr)
+        msg = f"Slack error (KPI): {e.response['error']}"
+        print(msg, file=sys.stderr)
+        send_error_dm(client, msg)
         sys.exit(1)
 
     # ── Post VIP new entrants to #vip ─────────────────────────────────────────
@@ -434,7 +446,9 @@ def main():
         )
         print(f"VIP report posted. ts={resp['ts']}")
     except SlackApiError as e:
-        print(f"Slack error (VIP): {e.response['error']}", file=sys.stderr)
+        msg = f"Slack error (VIP): {e.response['error']}"
+        print(msg, file=sys.stderr)
+        send_error_dm(client, msg)
         sys.exit(1)
 
 
