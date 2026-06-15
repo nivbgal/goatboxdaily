@@ -189,8 +189,9 @@ def delta_usd(val, bl):
     if val is None:
         return "n/a"
     d = val - bl
-    sign = "+" if d >= 0 else ""
-    return f"{sign}${abs(d):.2f}" if d < 0 else f"+${d:.2f}"
+    if d >= 0:
+        return f"+${d:.2f}"
+    return f"-${abs(d):.2f}"
 
 def progress_bar(val, bl, tg, width=10):
     if val is None:
