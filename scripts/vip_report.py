@@ -108,9 +108,9 @@ def build_vip_blocks(vip_rows, purchase_rows):
         local = ts.astimezone(IDT)
         return f"• {local.strftime('%a %b %-d, %-I:%M %p IDT')} — ${p['amount_usd']:.2f} ({p['product_slug'] or '—'})"
 
-    def fmt_ggr(ggr):
-        sign = "+" if ggr >= 0 else ""
-        return f"{sign}${ggr:,.2f}"
+    def fmt_net_spend(v):
+        sign = "+" if v >= 0 else ""
+        return f"{sign}${v:,.2f}"
 
     TIER_EMOJI = {"GOAT": "🐐", "Gold": "🥇", "VIP": "⭐"}
 
@@ -123,7 +123,7 @@ def build_vip_blocks(vip_rows, purchase_rows):
         uid   = row["user_id"]
         tier  = row["tier_crossed"]
         ltv   = row["ltv_usd"]
-        ggr   = row["ggr_usd"]
+        net_spend = row["ggr_usd"]
         emoji = TIER_EMOJI.get(tier, "⭐")
         purchase_lines = "\n".join(fmt_purchase(p) for p in purchases_by_user.get(uid, []))
         if not purchase_lines:
@@ -135,7 +135,7 @@ def build_vip_blocks(vip_rows, purchase_rows):
                 "type": "mrkdwn",
                 "text": (
                     f"{emoji} *{tier}* — `{uid}`\n"
-                    f"LTV: *${ltv:,.2f}*  |  Platform GGR: *{fmt_ggr(ggr)}*\n"
+                    f"LTV: *${ltv:,.2f}*  |  Net Spend: *{fmt_net_spend(net_spend)}*\n"
                     f"Last 2 purchases:\n{purchase_lines}"
                 )
             }
