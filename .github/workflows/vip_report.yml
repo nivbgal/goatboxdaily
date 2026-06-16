@@ -1,0 +1,35 @@
+name: Daily VIP Report
+
+on:
+  schedule:
+    - cron: '0 5 * * *'   # 5:00 AM UTC every day
+  workflow_dispatch:
+
+jobs:
+  vip-report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install google-cloud-bigquery slack-sdk pyarrow
+
+      - name: Run VIP report
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: python scripts/vip_report.py
