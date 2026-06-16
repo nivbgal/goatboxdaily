@@ -1,0 +1,22 @@
+name: Delete Slack Message
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel_id:
+        required: true
+      ts:
+        required: true
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete message
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          curl -s -X POST https://slack.com/api/chat.delete \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"channel":"${{ inputs.channel_id }}","ts":"${{ inputs.ts }}"}'
