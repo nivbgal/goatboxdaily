@@ -136,11 +136,11 @@ ORDER BY crm.lifetime_purchases_usd DESC
 Q_VIP_PURCHASES = """
 WITH new_vips AS (
   SELECT user_id
-  FROM `goatbox-prod.processing_data.user_fact_crm`
+  FROM `goatbox-prod.processing_data.user_fact_crm` ufc
   WHERE last_purchase_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
     AND NOT EXISTS (
       SELECT 1 FROM `goatbox-prod.processing_data.internal_users` iu
-      WHERE iu.user_id = user_fact_crm.user_id
+      WHERE iu.user_id = ufc.user_id
     )
     AND (
       (lifetime_purchases_usd >= 1000
