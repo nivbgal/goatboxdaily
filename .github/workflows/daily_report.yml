@@ -1,0 +1,31 @@
+name: Daily Goatbox Report
+
+on:
+  schedule:
+    - cron: '0 5 * * *'   # 5:00 AM UTC every day — covers full previous calendar day
+  workflow_dispatch:       # lets you trigger it manually from GitHub too
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write GCP credentials
+        run: echo '${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}' > /tmp/gcp-key.json
+
+      - name: Run daily report
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp-key.json
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: python report.py
