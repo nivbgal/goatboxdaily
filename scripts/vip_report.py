@@ -19,10 +19,21 @@ SLACK_VIP_CHANNEL = "C0BAJM1T8LE"   # #vip
 ERROR_USER_ID     = "U0B0ZF5D6F9"   # niv — receives error DMs
 
 Q_VIP_NEW = """
+WITH vendor_costs AS (
+  SELECT
+    user_id,
+    ROUND(SUM(vendor_price + vendor_fee), 2) AS total_vendor_cost
+  FROM `goatbox-prod.processing_data.flat_order_vendor_pricing_events`
+  GROUP BY user_id
+)
 SELECT
   crm.user_id,
-  CAST(crm.lifetime_purchases_usd AS FLOAT64)  AS ltv_usd,
-  CAST(crm.net_loss_usd_lifetime   AS FLOAT64)  AS ggr_usd,
+  CAST(crm.lifetime_purchases_usd AS FLOAT64)                                   AS ltv_usd,
+  ROUND(
+    CAST(crm.lifetime_purchases_usd AS FLOAT64) - COALESCE(vc.total_vendor_cost, 0),
+    2
+  )                                                                               AS net_spend_usd,
+  (vc.user_id IS NULL)                                                            AS no_vendor_pricing,
   CASE
     WHEN crm.lifetime_purchases_usd >= 1000
          AND (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) < 1000 THEN 'GOAT'
@@ -32,6 +43,7 @@ SELECT
          AND (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) < 100  THEN 'VIP'
   END AS tier_crossed
 FROM `goatbox-prod.processing_data.user_fact_crm` crm
+LEFT JOIN vendor_costs vc ON vc.user_id = crm.user_id
 WHERE crm.last_purchase_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
   AND NOT EXISTS (
     SELECT 1 FROM `goatbox-prod.processing_data.internal_users` iu
@@ -108,9 +120,10 @@ def build_vip_blocks(vip_rows, purchase_rows):
         local = ts.astimezone(IDT)
         return f"• {local.strftime('%a %b %-d, %-I:%M %p IDT')} — ${p['amount_usd']:.2f} ({p['product_slug'] or '—'})"
 
-    def fmt_net_spend(v):
+    def fmt_net_spend(v, no_vendor_pricing):
         sign = "+" if v >= 0 else ""
-        return f"{sign}${v:,.2f}"
+        flag = " ⚠️" if no_vendor_pricing else ""
+        return f"{sign}${v:,.2f}{flag}"
 
     TIER_EMOJI = {"GOAT": "🐐", "Gold": "🥇", "VIP": "⭐"}
 
@@ -120,10 +133,11 @@ def build_vip_blocks(vip_rows, purchase_rows):
     blocks = [{"type": "header", "text": {"type": "plain_text", "text": "🆕 New VIP Entrants"}}]
 
     for row in vip_rows:
-        uid   = row["user_id"]
-        tier  = row["tier_crossed"]
-        ltv   = row["ltv_usd"]
-        net_spend = row["ggr_usd"]
+        uid               = row["user_id"]
+        tier              = row["tier_crossed"]
+        ltv               = row["ltv_usd"]
+        net_spend         = row["net_spend_usd"]
+        no_vendor_pricing = row["no_vendor_pricing"]
         emoji = TIER_EMOJI.get(tier, "⭐")
         purchase_lines = "\n".join(fmt_purchase(p) for p in purchases_by_user.get(uid, []))
         if not purchase_lines:
@@ -135,7 +149,7 @@ def build_vip_blocks(vip_rows, purchase_rows):
                 "type": "mrkdwn",
                 "text": (
                     f"{emoji} *{tier}* — `{uid}`\n"
-                    f"LTV: *${ltv:,.2f}*  |  Net Spend: *{fmt_net_spend(net_spend)}*\n"
+                    f"LTV: *${ltv:,.2f}*  |  Net Spend: *{fmt_net_spend(net_spend, no_vendor_pricing)}*\n"
                     f"Last 2 purchases:\n{purchase_lines}"
                 )
             }
