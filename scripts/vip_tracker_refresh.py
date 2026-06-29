@@ -256,6 +256,14 @@ def main():
 
     print(f"  BQ returned {len(bq_rows)} VIP rows")
 
+    # Guard: a 0-row result almost certainly means a query/data problem, not a real empty VIP list.
+    # Clearing the sheet on 0 rows would wipe all of Freya's notes.
+    if not bq_rows:
+        msg = "BQ returned 0 VIP rows - refusing to overwrite Sheet data"
+        print(msg, file=sys.stderr)
+        post_error(slack, msg)
+        sys.exit(1)
+
     # --- 2. Read existing Sheet to preserve Freya columns ---
     print("Reading existing Google Sheet...")
     sheets_creds = service_account.Credentials.from_service_account_info(
@@ -309,9 +317,15 @@ def main():
     # --- 4. Write back to Sheet ---
     print(f"Writing {len(merged_rows)} rows to Sheet...")
     output = [COLUMNS] + [row_to_list(r) for r in merged_rows]
-    ws.clear()
-    ws.update(output, "A1", value_input_option="USER_ENTERED")
-    print("  Sheet updated.")
+    try:
+        ws.clear()
+        ws.update(output, "A1", value_input_option="USER_ENTERED")
+        print("  Sheet updated.")
+    except Exception as exc:
+        msg = f"Sheet write failed (may be partially cleared - check Sheet): {exc}"
+        print(msg, file=sys.stderr)
+        post_error(slack, msg)
+        sys.exit(1)
 
     # --- 5. Post heat summary to Slack #vip ---
     print("Posting heat summary to #vip...")
