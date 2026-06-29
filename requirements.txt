@@ -2,3 +2,5 @@ google-cloud-bigquery
 db-dtypes
 matplotlib
 slack-sdk
+gspread
+google-auth

@@ -27,9 +27,15 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install google-cloud-bigquery slack-sdk pyarrow
+        run: pip install google-cloud-bigquery slack-sdk pyarrow gspread google-auth
 
-      - name: Run VIP report
+      - name: Run VIP report (new entrants)
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         run: python scripts/vip_report.py
+
+      - name: Run VIP tracker refresh (roster + heat scores)
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+        run: python scripts/vip_tracker_refresh.py
