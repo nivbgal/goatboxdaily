@@ -1,0 +1,30 @@
+name: Keep Scheduled Workflows Active
+
+on:
+  schedule:
+    # Public-repository schedules are disabled after 60 days without activity.
+    # Two maintenance commits per month keep the daily reports active.
+    - cron: '17 3 1,15 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keep-scheduled-workflows-active
+  cancel-in-progress: false
+
+jobs:
+  keep-active:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@v4
+
+      - name: Record repository activity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keep scheduled workflows active"
+          git push
