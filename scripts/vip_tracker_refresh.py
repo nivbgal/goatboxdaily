@@ -4,6 +4,10 @@ Refreshes the GOATBox VIP roster in Google Sheets and posts a heat summary to #v
 
 Runs daily as a step in vip_report.yml, after the new-entrants report.
 
+Tier movement: each run compares the tier BigQuery reports now against the `tier`
+the Sheet recorded last run. A difference writes `previous_tier` + `tier_changed_at`
+and shows up in the "Tier moves today" section of the heat summary.
+
 Env vars required:
   GCP_SERVICE_ACCOUNT_JSON   full JSON of the GCP service account key
   SLACK_BOT_TOKEN            xoxb-... token with chat:write scope
@@ -39,6 +43,9 @@ FREYA_COLS = [
     "conversation_note_1", "conversation_note_2", "conversation_note_3", "manager_notes",
 ]
 CALC_COLS = ["recency_score", "context_score", "hot_cold_score", "hot_cold_label", "score_updated"]
+# Tier history is carried forward from the Sheet run-to-run, not recomputed from BQ.
+# Appended at the end of COLUMNS so existing column positions don't shift.
+TIER_HISTORY_COLS = ["previous_tier", "tier_changed_at"]
 
 COLUMNS = [
     "user_id", "first_name", "last_name", "email", "tier", "ltv_usd", "net_spend_usd",
@@ -47,7 +54,10 @@ COLUMNS = [
     "favorite_box_category", "preferred_channel", "relationship_stage", "last_contacted_at",
     "conversation_note_1", "conversation_note_2", "conversation_note_3", "manager_notes",
     "recency_score", "context_score", "hot_cold_score", "hot_cold_label", "score_updated",
+    "previous_tier", "tier_changed_at",
 ]
+
+TIER_RANK = {"VIP": 1, "Gold": 2, "GOAT": 3}
 
 BQ_SQL = """
 SELECT
@@ -117,6 +127,29 @@ def calc_hot_cold_label(score):
     if score >= 15:
         return "Cold"
     return "Inactive"
+
+
+def resolve_tier_change(new_tier, existing, is_new, today_str):
+    """Compare the tier BQ reports now against the tier the Sheet recorded last run.
+
+    Returns (fields_to_write, move) where move is "up" / "down" / "new" / "" — move is
+    only for today's Slack summary and is never written to the Sheet.
+    """
+    sheet_tier = str(existing.get("tier", "") or "").strip()
+
+    if is_new:
+        # First time on the roster: they arrived at this tier today.
+        return {"previous_tier": "", "tier_changed_at": today_str}, "new"
+
+    if sheet_tier and sheet_tier != new_tier:
+        move = "up" if TIER_RANK.get(new_tier, 0) > TIER_RANK.get(sheet_tier, 0) else "down"
+        return {"previous_tier": sheet_tier, "tier_changed_at": today_str}, move
+
+    # No change today — carry forward whatever the last move was.
+    return {
+        "previous_tier": str(existing.get("previous_tier", "") or ""),
+        "tier_changed_at": str(existing.get("tier_changed_at", "") or ""),
+    }, ""
 
 
 def compute_scores(row, today_str):
@@ -204,6 +237,25 @@ def build_slack_message(merged_rows, today_str):
             lines.append(
                 f"- `{r['user_id']}` | {r.get('tier', '')} | "
                 f"{fmt_ltv(r)} | {r.get('days_since_last_session', '?')}d since last session"
+            )
+    else:
+        lines.append("- None")
+
+    # Tier moves detected this run, biggest new tier first
+    tier_moves = sorted(
+        [r for r in merged_rows if r.get("_tier_move") in ("up", "down")],
+        key=lambda r: (TIER_RANK.get(r.get("tier", ""), 0), float(r.get("ltv_usd") or 0)),
+        reverse=True,
+    )
+
+    lines += ["", "*Tier moves today:*"]
+
+    if tier_moves:
+        for r in tier_moves:
+            arrow = ":arrow_up:" if r["_tier_move"] == "up" else ":arrow_down:"
+            lines.append(
+                f"- {arrow} `{r['user_id']}` | {r.get('previous_tier', '')} → {r.get('tier', '')} | "
+                f"{fmt_ltv(r)} LTV"
             )
     else:
         lines.append("- None")
@@ -308,8 +360,16 @@ def main():
             else:
                 row[col] = str(existing.get(col, "") or "")
 
+        tier_fields, move = resolve_tier_change(row["tier"], existing, is_new, today_str)
+        row.update(tier_fields)
+        row["_tier_move"] = move  # transient, not in COLUMNS so never written to the Sheet
+
         row.update(compute_scores(row, today_str))
         merged_rows.append(row)
+
+    n_up = sum(1 for r in merged_rows if r["_tier_move"] == "up")
+    n_down = sum(1 for r in merged_rows if r["_tier_move"] == "down")
+    print(f"  Tier moves since last run: {n_up} up, {n_down} down")
 
     # Sort ascending by hot_cold_score so coldest VIPs appear first in Sheet
     merged_rows.sort(key=lambda r: float(r.get("hot_cold_score") or 0))

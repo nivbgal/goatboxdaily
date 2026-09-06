@@ -1,6 +1,10 @@
 """
 vip_report.py
-Checks for new VIP tier crossings in the last 24h and posts to #vip.
+Checks for VIP tier crossings in the last 24h and posts to #vip.
+
+Splits crossings into two groups:
+  - new entrants  — had no tier before this purchase (crossed $100 for the first time)
+  - tier upgrades — already a VIP/Gold and moved up (e.g. Gold -> GOAT)
 
 Secrets required:
   GCP_SERVICE_ACCOUNT_JSON   full JSON content of the GCP service account key
@@ -41,7 +45,14 @@ SELECT
          AND (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) < 250  THEN 'Gold'
     WHEN crm.lifetime_purchases_usd >= 100
          AND (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) < 100  THEN 'VIP'
-  END AS tier_crossed
+  END AS tier_crossed,
+  -- Tier held immediately before the last purchase. NULL means they were not a
+  -- VIP at all, i.e. this is a brand-new entrant rather than an upgrade.
+  CASE
+    WHEN (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) >= 1000 THEN 'GOAT'
+    WHEN (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) >= 250  THEN 'Gold'
+    WHEN (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) >= 100  THEN 'VIP'
+  END AS prev_tier
 FROM `goatbox-prod.processing_data.user_fact_crm` crm
 LEFT JOIN vendor_costs vc ON vc.user_id = crm.user_id
 WHERE crm.last_purchase_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
@@ -128,13 +139,16 @@ def build_vip_blocks(vip_rows, purchase_rows):
     TIER_EMOJI = {"GOAT": "🐐", "Gold": "🥇", "VIP": "⭐"}
 
     if not vip_rows:
-        return [{"type": "section", "text": {"type": "mrkdwn", "text": "No new VIPs today."}}]
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": "No new VIPs or tier upgrades today."}}]
 
-    blocks = [{"type": "header", "text": {"type": "plain_text", "text": "🆕 New VIP Entrants"}}]
+    # prev_tier NULL => they held no tier before this purchase => brand-new entrant
+    new_entrants = [r for r in vip_rows if not r.get("prev_tier")]
+    upgrades     = [r for r in vip_rows if r.get("prev_tier")]
 
-    for row in vip_rows:
+    def vip_section(row):
         uid               = row["user_id"]
         tier              = row["tier_crossed"]
+        prev_tier         = row.get("prev_tier")
         ltv               = row["ltv_usd"]
         net_spend         = row["net_spend_usd"]
         no_vendor_pricing = row["no_vendor_pricing"]
@@ -143,18 +157,32 @@ def build_vip_blocks(vip_rows, purchase_rows):
         if not purchase_lines:
             purchase_lines = "• No purchase records found"
 
-        blocks.append({
+        if prev_tier:
+            headline = f"{emoji} *{prev_tier} → {tier}* — `{uid}`"
+        else:
+            headline = f"{emoji} *{tier}* — `{uid}`"
+
+        return {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"{emoji} *{tier}* — `{uid}`\n"
+                    f"{headline}\n"
                     f"LTV: *${ltv:,.2f}*  |  Net Spend: *{fmt_net_spend(net_spend, no_vendor_pricing)}*\n"
                     f"Last 2 purchases:\n{purchase_lines}"
                 )
             }
-        })
-        blocks.append({"type": "divider"})
+        }
+
+    blocks = []
+
+    for title, rows in (("🆕 New VIP Entrants", new_entrants), ("⬆️ Tier Upgrades", upgrades)):
+        if not rows:
+            continue
+        blocks.append({"type": "header", "text": {"type": "plain_text", "text": title}})
+        for row in rows:
+            blocks.append(vip_section(row))
+            blocks.append({"type": "divider"})
 
     return blocks
 
@@ -178,10 +206,20 @@ def main():
         send_error_dm(client, msg)
         sys.exit(1)
 
-    print(f"  New VIP rows: {len(vip_rows)}")
+    n_new      = sum(1 for r in vip_rows if not r.get("prev_tier"))
+    n_upgrades = len(vip_rows) - n_new
+    print(f"  Tier crossings: {len(vip_rows)} ({n_new} new entrant(s), {n_upgrades} upgrade(s))")
 
     blocks = build_vip_blocks(vip_rows, purchase_rows)
-    fallback = f"🆕 {len(vip_rows)} new VIP entrant(s) today" if vip_rows else "No new VIPs today."
+    if vip_rows:
+        parts = []
+        if n_new:
+            parts.append(f"🆕 {n_new} new VIP entrant(s)")
+        if n_upgrades:
+            parts.append(f"⬆️ {n_upgrades} tier upgrade(s)")
+        fallback = ", ".join(parts) + " today"
+    else:
+        fallback = "No new VIPs or tier upgrades today."
 
     print("Posting to #vip...")
     try:
