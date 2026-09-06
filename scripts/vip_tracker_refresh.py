@@ -60,6 +60,13 @@ COLUMNS = [
 TIER_RANK = {"VIP": 1, "Gold": 2, "GOAT": 3}
 
 BQ_SQL = """
+WITH crm_dedup AS (
+  -- user_fact_crm contains exact duplicate rows for ~82 user_ids; without this
+  -- those VIPs get two rows in the Sheet and are double-counted everywhere.
+  SELECT *
+  FROM `goatbox-prod.processing_data.user_fact_crm`
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY last_purchase_at DESC) = 1
+)
 SELECT
   crm.user_id,
   CASE
@@ -77,7 +84,7 @@ SELECT
   ROUND(CAST(crm.lifetime_purchases_usd AS FLOAT64) / NULLIF(crm.total_purchases, 0), 2) AS avg_transaction_usd,
   crm.country,
   crm.favorite_box_category
-FROM `goatbox-prod.processing_data.user_fact_crm` crm
+FROM crm_dedup crm
 LEFT JOIN (
   SELECT
     o.user_id,

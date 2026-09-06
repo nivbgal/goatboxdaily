@@ -21,9 +21,17 @@ from slack_sdk.errors import SlackApiError
 
 SLACK_VIP_CHANNEL = "C0BAJM1T8LE"   # #vip
 ERROR_USER_ID     = "U0B0ZF5D6F9"   # niv — receives error DMs
+MAX_BLOCKS        = 50              # Slack hard limit per message
 
 Q_VIP_NEW = """
-WITH vendor_costs AS (
+WITH crm_dedup AS (
+  -- user_fact_crm contains exact duplicate rows for ~82 user_ids; without this
+  -- a crossing gets reported once per duplicate.
+  SELECT *
+  FROM `goatbox-prod.processing_data.user_fact_crm`
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY last_purchase_at DESC) = 1
+),
+vendor_costs AS (
   SELECT
     user_id,
     ROUND(SUM(vendor_price + vendor_fee), 2) AS total_vendor_cost
@@ -53,7 +61,7 @@ SELECT
     WHEN (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) >= 250  THEN 'Gold'
     WHEN (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) >= 100  THEN 'VIP'
   END AS prev_tier
-FROM `goatbox-prod.processing_data.user_fact_crm` crm
+FROM crm_dedup crm
 LEFT JOIN vendor_costs vc ON vc.user_id = crm.user_id
 WHERE crm.last_purchase_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
   AND NOT EXISTS (
@@ -73,7 +81,8 @@ ORDER BY crm.lifetime_purchases_usd DESC
 
 Q_VIP_PURCHASES = """
 WITH new_vips AS (
-  SELECT user_id
+  -- DISTINCT: duplicate crm rows would otherwise fan out the purchase join below
+  SELECT DISTINCT user_id
   FROM `goatbox-prod.processing_data.user_fact_crm` ufc
   WHERE last_purchase_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
     AND NOT EXISTS (
@@ -175,14 +184,29 @@ def build_vip_blocks(vip_rows, purchase_rows):
         }
 
     blocks = []
+    truncated = 0
 
     for title, rows in (("🆕 New VIP Entrants", new_entrants), ("⬆️ Tier Upgrades", upgrades)):
         if not rows:
             continue
         blocks.append({"type": "header", "text": {"type": "plain_text", "text": title}})
         for row in rows:
+            # Slack rejects a message with >50 blocks outright; leave room for the
+            # remaining header and the truncation notice rather than failing the run.
+            if len(blocks) >= MAX_BLOCKS - 3:
+                truncated += 1
+                continue
             blocks.append(vip_section(row))
             blocks.append({"type": "divider"})
+
+    if truncated:
+        blocks.append({
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": f"_…and {truncated} more not shown (Slack block limit). Full list in the tracker Sheet._",
+            }],
+        })
 
     return blocks
 
