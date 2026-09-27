@@ -1,0 +1,22 @@
+name: Slack Cleanup (temporary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      timestamps:
+        description: 'Comma-separated parent message timestamps to delete'
+        required: true
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - run: pip install slack-sdk
+      - env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          TARGET_TS: ${{ inputs.timestamps }}
+        run: python scripts/slack_cleanup.py
