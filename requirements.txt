@@ -3,3 +3,4 @@ db-dtypes
 slack-sdk
 gspread
 google-auth
+matplotlib
