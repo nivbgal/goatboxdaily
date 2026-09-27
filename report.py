@@ -43,10 +43,12 @@ def send_error(msg):
         print(f"[send_error] Slack notification failed. Original error: {msg}", file=sys.stderr)
 
 def usd(v):
-    return f"${float(v or 0):,.2f}"
+    v = float(v or 0)
+    return f"-${abs(v):,.2f}" if v < 0 else f"${v:,.2f}"
 
 def usd0(v):
-    return f"${float(v or 0):,.0f}"
+    v = float(v or 0)
+    return f"-${abs(v):,.0f}" if v < 0 else f"${v:,.0f}"
 
 def pct(part, whole):
     return round(part / whole * 100) if whole else 0
@@ -153,6 +155,65 @@ try:
           )
           GROUP BY 1
         ),
+        dau_d AS (
+          SELECT DATE(event_timestamp) d, COUNT(DISTINCT user_id) n
+          FROM `{PROJECT}.flat_login_events`
+          WHERE DATE(event_timestamp) BETWEEN DATE_SUB(DATE 'DATE_FILTER', INTERVAL {TREND_DAYS - 1} DAY) AND DATE 'DATE_FILTER' AND {not_internal()}
+          GROUP BY 1
+        ),
+        box AS (
+          SELECT DATE(event_timestamp) d,
+                 SUM(boxes_opened_count) AS opens,
+                 COUNT(DISTINCT user_id) AS openers,
+                 ROUND(SUM(total_coins_spent), 0) AS coins
+          FROM `{PROJECT}.flat_box_events`
+          WHERE DATE(event_timestamp) BETWEEN DATE_SUB(DATE 'DATE_FILTER', INTERVAL {TREND_DAYS - 1} DAY) AND DATE 'DATE_FILTER' AND {not_internal()}
+          GROUP BY 1
+        ),
+        box_payers AS (
+          SELECT DATE(b.event_timestamp) d,
+                 SUM(b.boxes_opened_count) AS opens,
+                 ROUND(SUM(b.total_coins_spent), 0) AS coins
+          FROM `{PROJECT}.flat_box_events` b
+          WHERE DATE(b.event_timestamp) BETWEEN DATE_SUB(DATE 'DATE_FILTER', INTERVAL {TREND_DAYS - 1} DAY) AND DATE 'DATE_FILTER' AND {not_internal('b.')}
+            AND EXISTS (
+              SELECT 1 FROM `{PROJECT}.flat_purchase_events` p
+              WHERE p.user_id = b.user_id AND DATE(p.event_timestamp) = DATE(b.event_timestamp)
+            )
+          GROUP BY 1
+        ),
+        -- Coins burned on box opens split into purchased vs free/promo currency.
+        coin_mix AS (
+          SELECT DATE(event_timestamp) d,
+                 ROUND(SUM(tx_coin_breakdown_transactional), 0) AS paid_coins,
+                 ROUND(SUM(tx_coin_breakdown_free), 0)          AS free_coins
+          FROM `{PROJECT}.flat_balance_events`
+          WHERE DATE(event_timestamp) BETWEEN DATE_SUB(DATE 'DATE_FILTER', INTERVAL {TREND_DAYS - 1} DAY) AND DATE 'DATE_FILTER' AND {not_internal()}
+            AND tx_action = 'paid_box_opening_debit' AND tx_asset = 'coin'
+          GROUP BY 1
+        ),
+        -- Vouchers and XP are non-claimable: they cannot be shipped and vouchers
+        -- recirculate as coins, so only the rest counts as real payout for GBR.
+        items AS (
+          SELECT DATE(event_timestamp) d,
+                 ROUND(SUM(IF(asset_slug NOT LIKE '%voucher%' AND asset_slug != 'xp',
+                              asset_single_value * amount, 0)), 0) AS claimable_value,
+                 ROUND(SUM(IF(asset_slug LIKE '%voucher%' OR asset_slug = 'xp',
+                              asset_single_value * amount, 0)), 0) AS noncla_value
+          FROM `{PROJECT}.flat_box_items`
+          WHERE DATE(event_timestamp) BETWEEN DATE_SUB(DATE 'DATE_FILTER', INTERVAL {TREND_DAYS - 1} DAY) AND DATE 'DATE_FILTER' AND {not_internal()}
+          GROUP BY 1
+        ),
+        claims AS (
+          SELECT DATE(event_timestamp) d,
+                 COUNT(*) AS n,
+                 COUNT(DISTINCT user_id) AS claimers,
+                 ROUND(SUM(basket_value), 2)    AS basket_value,
+                 ROUND(SUM(shipping_total), 2)  AS shipping_total
+          FROM `{PROJECT}.flat_claim_shipping_paid`
+          WHERE DATE(event_timestamp) BETWEEN DATE_SUB(DATE 'DATE_FILTER', INTERVAL {TREND_DAYS - 1} DAY) AND DATE 'DATE_FILTER' AND {not_internal()}
+          GROUP BY 1
+        ),
         aml AS (
           SELECT DATE(event_timestamp) d,
             COUNT(DISTINCT IF(event_name = 'aml_submitted', user_id, NULL)) submitted,
@@ -186,7 +247,24 @@ try:
           IFNULL(disp.aband_blocked_usd, 0) AS aband_blocked_usd,
           IFNULL(disp.aband_silent_usd, 0)  AS aband_silent_usd,
           IFNULL(disp.aband_silent_users, 0) AS aband_silent_users,
-          IFNULL(blk_only.n, 0)            AS blocked_no_checkout
+          IFNULL(blk_only.n, 0)            AS blocked_no_checkout,
+          IFNULL(dau_d.n, 0)               AS dau,
+          IFNULL(box.opens, 0)             AS box_opens,
+          IFNULL(box.openers, 0)           AS box_openers,
+          IFNULL(box.coins, 0)             AS box_coins,
+          IFNULL(box_payers.opens, 0)      AS payer_box_opens,
+          IFNULL(box_payers.coins, 0)      AS payer_box_coins,
+          IFNULL(coin_mix.paid_coins, 0)   AS paid_coins,
+          IFNULL(coin_mix.free_coins, 0)   AS free_coins,
+          SAFE_DIVIDE(IFNULL(box.opens, 0), NULLIF(dau_d.n, 0))            AS opens_per_dau,
+          SAFE_DIVIDE(IFNULL(box_payers.opens, 0), NULLIF(pur.u, 0))       AS opens_per_payer,
+          IFNULL(items.claimable_value, 0)  AS claimable_value,
+          IFNULL(items.noncla_value, 0)     AS noncla_value,
+          IFNULL(box.coins, 0) - IFNULL(items.claimable_value, 0) AS gbr,
+          IFNULL(claims.n, 0)               AS claims,
+          IFNULL(claims.claimers, 0)        AS claimers,
+          IFNULL(claims.basket_value, 0)    AS claim_value,
+          IFNULL(claims.shipping_total, 0)  AS claim_shipping
         FROM spine
         LEFT JOIN reg  ON reg.d  = spine.d
         LEFT JOIN shop ON shop.d = spine.d
@@ -198,15 +276,14 @@ try:
         LEFT JOIN aml  ON aml.d  = spine.d
         LEFT JOIN disp ON disp.d = spine.d
         LEFT JOIN blk_only ON blk_only.d = spine.d
+        LEFT JOIN dau_d ON dau_d.d = spine.d
+        LEFT JOIN box ON box.d = spine.d
+        LEFT JOIN box_payers ON box_payers.d = spine.d
+        LEFT JOIN coin_mix ON coin_mix.d = spine.d
+        LEFT JOIN items ON items.d = spine.d
+        LEFT JOIN claims ON claims.d = spine.d
         ORDER BY day
     """)
-
-    dau_rows = q(f"""
-        SELECT COUNT(DISTINCT user_id) AS daily_active_users
-        FROM `{PROJECT}.flat_login_events`
-        WHERE DATE(event_timestamp) = 'DATE_FILTER' AND {not_internal()}
-    """)
-    dau_row = dau_rows[0] if dau_rows else {"daily_active_users": 0}
 
     summary_rows = q(f"""
         SELECT
@@ -369,7 +446,7 @@ def vs_avg(value, key, money=False):
     sign = "+" if delta >= 0 else ""
     return f"(7d avg {usd0(a) if money else round(a)}, {sign}{delta}%)"
 
-dau           = dau_row["daily_active_users"]
+dau           = int(t("dau"))
 total_payers  = summary["total_payers"]
 total_txns    = summary["total_transactions"]
 gross_rev     = float(summary["total_revenue_usd"] or 0)
@@ -397,6 +474,31 @@ blocked_no_checkout = int(t("blocked_no_checkout"))
 aml_submitted = int(t("aml_submitted"))
 aml_approved  = int(t("aml_approved"))
 aml_rejected  = int(t("aml_rejected"))
+
+box_opens_n    = int(t("box_opens"))
+box_openers    = int(t("box_openers"))
+box_coins      = t("box_coins")
+payer_opens    = int(t("payer_box_opens"))
+payer_coins    = t("payer_box_coins")
+paid_coins     = t("paid_coins")
+free_coins     = t("free_coins")
+coins_burned   = paid_coins + free_coins
+opens_per_dau    = box_opens_n / dau if dau else 0
+opens_per_payer  = payer_opens / total_payers if total_payers else 0
+# Credits price 1:1 with USD (N credits = $N - 0.01), so 1 coin ~ $1 of sticker value.
+avg_open_value       = box_coins / box_opens_n if box_opens_n else 0
+avg_open_value_payer = payer_coins / payer_opens if payer_opens else 0
+rev_per_open         = gross_rev / box_opens_n if box_opens_n else 0
+
+claimable_value = t("claimable_value")
+noncla_value    = t("noncla_value")
+gbr             = t("gbr")
+claims_n        = int(t("claims"))
+claimers_n      = int(t("claimers"))
+claim_value     = t("claim_value")
+claim_shipping  = t("claim_shipping")
+avg_claim       = claim_value / claims_n if claims_n else 0
+claims_per_payer = claims_n / total_payers if total_payers else 0
 
 intent_capture_pct = pct(gross_rev, intent_usd)
 arppu         = gross_rev / total_payers if total_payers else 0
@@ -530,19 +632,27 @@ try:
             ("Intent captured %",  [pct(float(r["gross_usd"] or 0), float(r["intent_usd"] or 0)) for r in trend], "{:,.0f}%"),
             ("Net revenue",        [float(r["net_usd"] or 0) for r in trend],       "${:,.0f}"),
             ("AML approved",       [float(r["aml_approved"] or 0) for r in trend],  "{:,.0f}"),
+            ("Box opens",          [float(r["box_opens"] or 0) for r in trend],     "{:,.0f}"),
+            ("GBR",                [float(r["gbr"] or 0) for r in trend],           "${:,.0f}"),
         ]
-        fig, axes = plt.subplots(2, 4, figsize=(15, 6.4))
+        fig, axes = plt.subplots(2, 5, figsize=(18.5, 6.4))
         fig.patch.set_facecolor(SURFACE)
         for ax, (label, series, fmt) in zip(axes.flat, panels):
             mean = sum(series) / len(series) if series else 0
             ax.bar(list(xs), series, width=0.62, color=S1)
             ax.axhline(mean, color=MUTED, linestyle="--", linewidth=1.4)
-            ax.text(len(trend) - 1, series[-1], fmt.format(series[-1]), ha="center", va="bottom",
+            last_label = fmt.format(series[-1]).replace("$-", "-$")
+            ax.text(len(trend) - 1, series[-1], last_label, ha="center",
+                    va="top" if series[-1] < 0 else "bottom",
                     fontsize=8.5, color=INK, fontweight="bold")
             ax.set_xticks(list(xs))
             ax.set_xticklabels([d.split()[1] for d in day_labels], fontsize=8)
-            ax.set_ylim(0, max(max(series), mean) * 1.28 if max(series) else 1)
-            style_axes(ax, f"{label}  ·  7d avg {fmt.format(mean)}")
+            hi = max(max(series), mean)
+            lo = min(min(series), mean, 0)
+            ax.set_ylim(lo * 1.25 if lo < 0 else 0, hi * 1.28 if hi else 1)
+            if lo < 0:
+                ax.axhline(0, color=GRID, linewidth=1)
+            style_axes(ax, f"{label}  ·  7d avg {fmt.format(mean).replace(chr(36) + chr(45), chr(45) + chr(36))}")
         fig.suptitle(f"Daily funnel vs {TREND_DAYS}-day average (dashed line) — to {DATE}",
                      fontsize=13, fontweight="bold", color=INK, x=0.005, ha="left")
         plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -646,6 +756,31 @@ if by_product:
         )
 else:
     lines.append("• No purchases recorded today")
+
+# Box economy
+lines += ["", "*Box Economy*", ""]
+lines += [
+    f"• *{box_opens_n:,}* opens by {box_openers:,} users · *{opens_per_dau:.1f}* per DAU "
+    f"{vs_avg(opens_per_dau, 'opens_per_dau')}",
+    f"• *{payer_opens:,}* opens by payers · *{opens_per_payer:.0f}* per payer "
+    f"{vs_avg(opens_per_payer, 'opens_per_payer')}",
+    f"• Avg box open · *{usd(avg_open_value)}* all users · *{usd(avg_open_value_payer)}* payers "
+    f"_(coin value, 1 credit ≈ $1)_",
+    f"• Revenue per open · *{usd(rev_per_open)}*  ·  coins burned *{coins_burned:,.0f}* "
+    f"({pct(paid_coins, coins_burned)}% purchased, {pct(free_coins, coins_burned)}% free/promo)",
+    f"• *GBR* · {usd0(box_coins)} coins in − {usd0(claimable_value)} claimable items out = "
+    f"*{usd0(gbr)}* {vs_avg(gbr, 'gbr', money=True)}",
+    f"    _excludes {usd0(noncla_value)} of vouchers/XP — non-claimable, cannot be shipped_",
+]
+
+# Claims
+lines += ["", "*Claims*", ""]
+lines += [
+    f"• *{claims_n}* claims by {plural(claimers_n, 'user')} {vs_avg(claims_n, 'claims')} · "
+    f"*{claims_per_payer:.2f}* per payer",
+    f"• *{usd(avg_claim)}* avg claim · {usd(claim_value)} basket value · "
+    f"{usd(claim_shipping)} shipping collected",
+]
 
 # Boxes — top 5
 lines += ["", "*Top Box Opens*", ""]
