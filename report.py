@@ -116,6 +116,43 @@ try:
             AND {not_internal()}
           GROUP BY 1
         ),
+        -- What became of each initiated purchase: completed, abandoned after an AML
+        -- block, or abandoned with no block at all. These three reconcile to intent.
+        done AS (
+          SELECT DISTINCT purchase_id
+          FROM `{PROJECT}.flat_purchase_events`
+          WHERE DATE(event_timestamp) >= DATE_SUB(DATE 'DATE_FILTER', INTERVAL {TREND_DAYS - 1} DAY)
+            AND purchase_id IS NOT NULL
+        ),
+        blocked_user_days AS (
+          SELECT DISTINCT user_id, DATE(event_timestamp) AS bd
+          FROM `{PROJECT}.flat_purchase_blocked_events`
+          WHERE DATE(event_timestamp) BETWEEN DATE_SUB(DATE 'DATE_FILTER', INTERVAL {TREND_DAYS - 1} DAY) AND DATE 'DATE_FILTER'
+        ),
+        disp AS (
+          SELECT
+            DATE(i.event_timestamp) d,
+            ROUND(SUM(IF(dn.purchase_id IS NOT NULL, i.amount_usd, 0)), 2) AS completed_usd,
+            ROUND(SUM(IF(dn.purchase_id IS NULL AND b.user_id IS NOT NULL, i.amount_usd, 0)), 2) AS aband_blocked_usd,
+            ROUND(SUM(IF(dn.purchase_id IS NULL AND b.user_id IS NULL, i.amount_usd, 0)), 2)     AS aband_silent_usd,
+            COUNT(DISTINCT IF(dn.purchase_id IS NULL AND b.user_id IS NULL, i.user_id, NULL))    AS aband_silent_users
+          FROM `{PROJECT}.flat_purchase_initiated_events` i
+          LEFT JOIN done dn ON dn.purchase_id = i.purchase_id
+          LEFT JOIN blocked_user_days b ON b.user_id = i.user_id AND b.bd = DATE(i.event_timestamp)
+          WHERE DATE(i.event_timestamp) BETWEEN DATE_SUB(DATE 'DATE_FILTER', INTERVAL {TREND_DAYS - 1} DAY) AND DATE 'DATE_FILTER'
+            AND {not_internal('i.')}
+          GROUP BY 1
+        ),
+        -- Blocked users who never even reached checkout that day.
+        blk_only AS (
+          SELECT b.bd AS d, COUNT(DISTINCT b.user_id) AS n
+          FROM blocked_user_days b
+          WHERE NOT EXISTS (
+            SELECT 1 FROM `{PROJECT}.flat_purchase_initiated_events` i
+            WHERE i.user_id = b.user_id AND DATE(i.event_timestamp) = b.bd
+          )
+          GROUP BY 1
+        ),
         aml AS (
           SELECT DATE(event_timestamp) d,
             COUNT(DISTINCT IF(event_name = 'aml_submitted', user_id, NULL)) submitted,
@@ -144,7 +181,12 @@ try:
           IFNULL(dis.u, 0)                 AS disputes,
           IFNULL(aml.submitted, 0)         AS aml_submitted,
           IFNULL(aml.approved, 0)          AS aml_approved,
-          IFNULL(aml.rejected, 0)          AS aml_rejected
+          IFNULL(aml.rejected, 0)          AS aml_rejected,
+          IFNULL(disp.completed_usd, 0)    AS completed_usd,
+          IFNULL(disp.aband_blocked_usd, 0) AS aband_blocked_usd,
+          IFNULL(disp.aband_silent_usd, 0)  AS aband_silent_usd,
+          IFNULL(disp.aband_silent_users, 0) AS aband_silent_users,
+          IFNULL(blk_only.n, 0)            AS blocked_no_checkout
         FROM spine
         LEFT JOIN reg  ON reg.d  = spine.d
         LEFT JOIN shop ON shop.d = spine.d
@@ -154,6 +196,8 @@ try:
         LEFT JOIN ref  ON ref.d  = spine.d
         LEFT JOIN dis  ON dis.d  = spine.d
         LEFT JOIN aml  ON aml.d  = spine.d
+        LEFT JOIN disp ON disp.d = spine.d
+        LEFT JOIN blk_only ON blk_only.d = spine.d
         ORDER BY day
     """)
 
@@ -346,6 +390,10 @@ intent_usd    = t("intent_usd")
 blocked_users = int(t("blocked_users"))
 blocked_evts  = int(t("blocked_events"))
 blocked_usd   = t("blocked_usd")
+aband_blocked_usd  = t("aband_blocked_usd")
+aband_silent_usd   = t("aband_silent_usd")
+aband_silent_users = int(t("aband_silent_users"))
+blocked_no_checkout = int(t("blocked_no_checkout"))
 aml_submitted = int(t("aml_submitted"))
 aml_approved  = int(t("aml_approved"))
 aml_rejected  = int(t("aml_rejected"))
@@ -529,8 +577,13 @@ lines += [
     f"• *Registrations* · {registrations:,} {vs_avg(registrations, 'registrations')}",
     f"• *Opened shop* · {shop_users:,} users {vs_avg(shop_users, 'shop_users')}",
     f"• *Started a purchase* · {intent_users:,} users · {usd(intent_usd)} of intent {vs_avg(intent_usd, 'intent_usd', money=True)}",
-    f"• *Completed* · {total_payers:,} users · {usd(gross_rev)} — *{intent_capture_pct}%* of intent captured",
-    f"• *Blocked* · {blocked_users:,} users · {usd(blocked_usd)} {vs_avg(blocked_usd, 'blocked_usd', money=True)}",
+    f"       ↳ *Completed* · {usd(t('completed_usd'))} (*{pct(t('completed_usd'), intent_usd)}%* of intent)",
+    f"       ↳ *Abandoned after AML block* · {usd(aband_blocked_usd)} ({pct(aband_blocked_usd, intent_usd)}%)",
+    f"       ↳ *Abandoned, no block* · {usd(aband_silent_usd)} (*{pct(aband_silent_usd, intent_usd)}%*) "
+    f"across {plural(aband_silent_users, 'user')}",
+    f"• *Blocked at AML wall* · {blocked_users:,} users · {usd(blocked_usd)} "
+    f"{vs_avg(blocked_usd, 'blocked_usd', money=True)}"
+    + (f" — {blocked_no_checkout} never reached checkout" if blocked_no_checkout else ""),
 ]
 
 # AML wall — headline numbers only; the per-user recovery list lives in the thread.
@@ -582,21 +635,15 @@ if total_payers:
 else:
     lines.append("• No purchases recorded today")
 
-# Product mix — top 5, remainder rolled up
-TOP_PRODUCTS = 5
+# Product mix — every product that sold
 lines += ["", "*Revenue by Store Product*", ""]
 if by_product:
-    for r in by_product[:TOP_PRODUCTS]:
+    for r in by_product:
         rev = float(r["revenue_usd"] or 0)
         lines.append(
             f"• *{clean_slug(r['product_slug'])}* · {usd(rev)} (*{pct(rev, gross_rev)}%*) · "
             f"{plural(int(r['transactions']), 'txn')} · {plural(int(r['payers']), 'payer')}"
         )
-    rest = by_product[TOP_PRODUCTS:]
-    if rest:
-        rest_rev = sum(float(x["revenue_usd"] or 0) for x in rest)
-        lines.append(f"• _+{plural(len(rest), 'other product')} · {usd(rest_rev)} "
-                     f"({pct(rest_rev, gross_rev)}%)_")
 else:
     lines.append("• No purchases recorded today")
 
