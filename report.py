@@ -504,7 +504,9 @@ except Exception as e:
     send_error(f"Chart generation failed:\n```{e}```")
     raise
 
-# ── Build Slack message ───────────────────────────────────────────────────────
+# ── Main message: macro only ──────────────────────────────────────────────────
+# Per-user breakdowns go to the thread so the channel message stays a constant
+# size regardless of how many payers, blocked users or new signups there were.
 lines = [
     f"\U0001f4b0 *Goatbox Daily Report — {DATE}*",
     "",
@@ -521,7 +523,7 @@ if refund_usd or dispute_count:
         + (f" · {plural(dispute_count, 'dispute')} opened" if dispute_count else "") + "_"
     )
 
-# ── Purchase funnel ───────────────────────────────────────────────────────────
+# Funnel
 lines += ["", f"*Purchase Funnel* — yesterday vs {TREND_DAYS}-day average", ""]
 lines += [
     f"• *Registrations* · {registrations:,} {vs_avg(registrations, 'registrations')}",
@@ -531,150 +533,77 @@ lines += [
     f"• *Blocked* · {blocked_users:,} users · {usd(blocked_usd)} {vs_avg(blocked_usd, 'blocked_usd', money=True)}",
 ]
 
-# ── The AML wall ──────────────────────────────────────────────────────────────
-lines += ["", "*Blocked at the AML Wall*", ""]
-if blocked_reasons:
-    for r in blocked_reasons:
-        lines.append(
-            f"• *{r['event_name']}* / `{r['aml_status']}` · {plural(int(r['users']), 'user')} · "
-            f"{int(r['events'])} attempts · {usd(r['intent_usd'])} blocked"
-        )
-    ratio = (blocked_7d / gross_7d) if gross_7d else 0
-    lines.append(
-        f"• _{TREND_DAYS}-day total: {usd(blocked_7d)} blocked vs {usd(gross_7d)} captured "
-        f"({ratio:.1f}× captured revenue)_"
-    )
-else:
-    lines.append("• No blocked purchases yesterday")
-
+# AML wall — headline numbers only; the per-user recovery list lives in the thread.
 if blocked_detail:
     recovered = [b for b in blocked_detail if b.get("purchased_since")]
-    lines += ["", f"*Recovery list* — top blocked users by intended spend "
-                  f"({len(recovered)}/{len(blocked_detail)} have purchased since)", ""]
-    for b in blocked_detail[:MAX_BLOCKED_DETAIL]:
-        if b.get("purchased_since"):
-            state = "✅ purchased since"
-        elif b.get("cleared_aml"):
-            state = "⚠️ cleared AML, no purchase"
-        else:
-            state = "❌ still blocked"
+    cleared   = [b for b in blocked_detail if b.get("cleared_aml") and not b.get("purchased_since")]
+    ratio     = (blocked_7d / gross_7d) if gross_7d else 0
+    top       = blocked_reasons[0] if blocked_reasons else None
+    lines += ["", "*Blocked at the AML Wall*", ""]
+    lines.append(
+        f"• *{usd(blocked_usd)}* blocked across *{plural(blocked_users, 'user')}* "
+        f"({blocked_evts} attempts) — {TREND_DAYS}d: {usd(blocked_7d)} vs {usd(gross_7d)} captured "
+        f"(*{ratio:.1f}×*)"
+    )
+    if top:
+        others = len(blocked_reasons) - 1
         lines.append(
-            f"• *`{b['user_id']}`* · {usd(b['intent_usd'])} intended · "
-            f"{plural(int(b['attempts']), 'attempt')} · last {b['last_attempt_utc']} UTC · {state}"
+            f"• Reason · `{top['event_name']}` / `{top['aml_status']}` "
+            f"({pct(int(top['users']), blocked_users)}% of blocked users)"
+            + (f" · +{plural(others, 'other reason')}" if others > 0 else "")
         )
-    hidden = len(blocked_detail) - MAX_BLOCKED_DETAIL
-    if hidden > 0:
-        hidden_usd = sum(float(x["intent_usd"] or 0) for x in blocked_detail[MAX_BLOCKED_DETAIL:])
-        lines.append(f"_+{plural(hidden, 'more blocked user')} · {usd(hidden_usd)} combined_")
+    lines.append(
+        f"• Since blocked · *{len(recovered)}* purchased · *{len(cleared)}* cleared AML but no purchase · "
+        f"*{len(blocked_detail) - len(recovered) - len(cleared)}* still blocked"
+    )
 
-# ── KYC / AML ─────────────────────────────────────────────────────────────────
+# KYC — one line
 lines += ["", "*KYC / AML*", ""]
-lines += [
-    f"• *Submitted* · {aml_submitted} {vs_avg(aml_submitted, 'aml_submitted')}",
-    f"• *Approved* · {aml_approved} {vs_avg(aml_approved, 'aml_approved')}"
-    + (f" · {pct(aml_approved, aml_submitted)}% pass rate" if aml_submitted else ""),
-    f"• *Rejected* · {aml_rejected} {vs_avg(aml_rejected, 'aml_rejected')}",
-]
+lines.append(
+    f"• {aml_submitted} submitted · {aml_approved} approved"
+    + (f" (*{pct(aml_approved, aml_submitted)}%* pass)" if aml_submitted else "")
+    + f" · {aml_rejected} rejected  _({TREND_DAYS}d avg {round(avg7('aml_submitted'))} / "
+      f"{round(avg7('aml_approved'))} / {round(avg7('aml_rejected'))})_"
+)
 
-# ── Revenue split: new vs returning ───────────────────────────────────────────
+# New vs returning
 lines += ["", "*Revenue Split — New vs Returning*", ""]
 if total_payers:
     for label, s in (("Returning", ret_stats), ("New", new_stats)):
         lines.append(
-            f"• *{label}* · {usd(s['rev'])} (*{s['rev_pct']}%* of revenue) · "
-            f"{plural(s['users'], 'payer')} ({s['user_pct']}%) · {plural(s['txns'], 'txn')} · "
-            f"{usd(s['arppu'])} ARPPU · {usd(s['avg_txn'])} avg/txn"
+            f"• *{label}* · {usd(s['rev'])} (*{s['rev_pct']}%*) · {plural(s['users'], 'payer')} "
+            f"({s['user_pct']}%) · {plural(s['txns'], 'txn')} · {usd(s['arppu'])} ARPPU"
         )
     if repeat_buyers:
         lines.append(
-            f"• *Repeat buyers today* · {plural(len(repeat_buyers), 'payer')} bought 2+ times · "
+            f"• *Repeat buyers* · {plural(len(repeat_buyers), 'payer')} bought 2+ times · "
             f"{usd(repeat_rev)} (*{pct(repeat_rev, gross_rev)}%* of revenue)"
         )
 else:
     lines.append("• No purchases recorded today")
 
-# ── Returning payers, transaction by transaction ──────────────────────────────
-lines += ["", f"*Returning Payers — Same-Day Purchases* ({len(return_payers)} total)", ""]
-if return_payers:
-    ranked = sorted(return_payers, key=lambda r: -float(r.get("today_revenue_usd") or 0))
-    for idx, r in enumerate(ranked[:MAX_RETURNING_DETAIL], start=1):
-        uid   = r["user_id"]
-        a     = activity.get(uid, {})
-        txns  = int(a.get("txns") or 0)
-        today = float(r.get("today_revenue_usd") or 0)
-        days  = r.get("days_since_last_purchase")
-        last  = r.get("last_prior_purchase_date")
-        gap = "no prior purchase date on record" if days is None else \
-              f"back after {plural(days, 'day')} (last: {last})"
-        timing = timing_line(uid)
-        lines.append(f"*{idx}. `{uid}`* — *{usd(today)}* today · {plural(txns, 'txn')} · {pct(today, gross_rev)}% of daily revenue")
-        lines.append(f"     ↳ bought: {items_line(uid)}")
-        if timing:
-            lines.append(f"     ↳ {timing}")
-        lines.append(
-            f"     ↳ {gap} · {usd(r.get('prior_revenue_usd'))} prior spend over "
-            f"{plural(int(r.get('prior_purchases') or 0), 'purchase')} · {usd(r.get('lifetime_value_usd'))} LTV"
-        )
-        lines.append("")
-    if lines and lines[-1] == "":
-        lines.pop()
-    hidden = len(ranked) - MAX_RETURNING_DETAIL
-    if hidden > 0:
-        hidden_rev = sum(float(x.get("today_revenue_usd") or 0) for x in ranked[MAX_RETURNING_DETAIL:])
-        lines.append(f"_+{plural(hidden, 'more returning payer')} · {usd(hidden_rev)} combined_")
-else:
-    lines.append("• No returning payers today")
-
-# ── New payers ────────────────────────────────────────────────────────────────
-lines += ["", f"*New Payers — First Purchase* ({len(new_payers)} total)", ""]
-if new_payers:
-    ranked_new = sorted(new_payers, key=lambda r: -float(r.get("today_revenue_usd") or 0))
-    for r in ranked_new[:10]:
-        uid = r["user_id"]
-        a   = activity.get(uid, {})
-        lines.append(
-            f"• *`{uid}`* · {usd(r.get('today_revenue_usd'))} · "
-            f"{plural(int(a.get('txns') or 0), 'txn')} · {items_line(uid)}"
-        )
-    hidden_new = len(ranked_new) - 10
-    if hidden_new > 0:
-        hidden_new_rev = sum(float(x.get("today_revenue_usd") or 0) for x in ranked_new[10:])
-        lines.append(f"_+{plural(hidden_new, 'more new payer')} · {usd(hidden_new_rev)} combined_")
-else:
-    lines.append("• No new payers today")
-
-# ── Revenue by product ────────────────────────────────────────────────────────
+# Product mix — top 5, remainder rolled up
+TOP_PRODUCTS = 5
 lines += ["", "*Revenue by Store Product*", ""]
 if by_product:
-    for r in by_product:
+    for r in by_product[:TOP_PRODUCTS]:
         rev = float(r["revenue_usd"] or 0)
         lines.append(
             f"• *{clean_slug(r['product_slug'])}* · {usd(rev)} (*{pct(rev, gross_rev)}%*) · "
-            f"{plural(int(r['transactions']), 'txn')} · {plural(int(r['payers']), 'payer')} · "
-            f"{usd(r['avg_usd'])} avg"
+            f"{plural(int(r['transactions']), 'txn')} · {plural(int(r['payers']), 'payer')}"
         )
+    rest = by_product[TOP_PRODUCTS:]
+    if rest:
+        rest_rev = sum(float(x["revenue_usd"] or 0) for x in rest)
+        lines.append(f"• _+{plural(len(rest), 'other product')} · {usd(rest_rev)} "
+                     f"({pct(rest_rev, gross_rev)}%)_")
 else:
     lines.append("• No purchases recorded today")
 
-# ── Top spenders ──────────────────────────────────────────────────────────────
-lines += ["", "*Top Spenders*", ""]
-if today_by_user:
-    payer_type = {r["user_id"]: r["payer_type"] for r in cohort}
-    for r in today_by_user[:10]:
-        uid = r["user_id"]
-        rev = float(r["revenue_usd"] or 0)
-        tag = "new" if payer_type.get(uid) == "new" else "returning"
-        lines.append(
-            f"• *`{uid}`* · {usd(rev)} (*{pct(rev, gross_rev)}%*) · "
-            f"{plural(int(r['txns'] or 0), 'txn')} · {usd(r['avg_txn_usd'])} avg/txn · _{tag}_"
-        )
-else:
-    lines.append("• No data")
-
-# ── Top box opens ─────────────────────────────────────────────────────────────
+# Boxes — top 5
 lines += ["", "*Top Box Opens*", ""]
 if box_opens:
-    for r in box_opens:
+    for r in box_opens[:5]:
         lines.append(
             f"• *{r['box_display_name']}* · {int(r['total_opens']):,} opens · "
             f"{plural(int(r['unique_openers']), 'user')} · vol {r['box_volatility']}"
@@ -682,18 +611,126 @@ if box_opens:
 else:
     lines.append("• No box opens by paying users today")
 
+lines += ["", "\U0001f9f5 _In thread: returning-payer detail · new payers & top spenders · "
+              "AML recovery list · 7-day trend charts_"]
+
 message = "\n".join(lines)
 
+# ── Thread detail ─────────────────────────────────────────────────────────────
+def returning_detail():
+    out = [f"*Returning Payers — Same-Day Purchases* ({len(return_payers)} total)", ""]
+    if not return_payers:
+        return out + ["• No returning payers today"]
+    ranked = sorted(return_payers, key=lambda r: -float(r.get("today_revenue_usd") or 0))
+    for idx, r in enumerate(ranked[:MAX_RETURNING_DETAIL], start=1):
+        uid   = r["user_id"]
+        a     = activity.get(uid, {})
+        txns  = int(a.get("txns") or 0)
+        today = float(r.get("today_revenue_usd") or 0)
+        days  = r.get("days_since_last_purchase")
+        gap = "no prior purchase date on record" if days is None else \
+              f"back after {plural(days, 'day')} (last: {r.get('last_prior_purchase_date')})"
+        timing = timing_line(uid)
+        out.append(f"*{idx}. `{uid}`* — *{usd(today)}* today · {plural(txns, 'txn')} · "
+                   f"{pct(today, gross_rev)}% of daily revenue")
+        out.append(f"     ↳ bought: {items_line(uid)}")
+        if timing:
+            out.append(f"     ↳ {timing}")
+        out.append(
+            f"     ↳ {gap} · {usd(r.get('prior_revenue_usd'))} prior spend over "
+            f"{plural(int(r.get('prior_purchases') or 0), 'purchase')} · {usd(r.get('lifetime_value_usd'))} LTV"
+        )
+        out.append("")
+    if out and out[-1] == "":
+        out.pop()
+    hidden = len(ranked) - MAX_RETURNING_DETAIL
+    if hidden > 0:
+        hidden_rev = sum(float(x.get("today_revenue_usd") or 0) for x in ranked[MAX_RETURNING_DETAIL:])
+        out.append(f"_+{plural(hidden, 'more returning payer')} · {usd(hidden_rev)} combined_")
+    return out
+
+def payers_detail():
+    out = [f"*New Payers — First Purchase* ({len(new_payers)} total)", ""]
+    if new_payers:
+        ranked_new = sorted(new_payers, key=lambda r: -float(r.get("today_revenue_usd") or 0))
+        for r in ranked_new[:10]:
+            uid = r["user_id"]
+            a   = activity.get(uid, {})
+            out.append(f"• *`{uid}`* · {usd(r.get('today_revenue_usd'))} · "
+                       f"{plural(int(a.get('txns') or 0), 'txn')} · {items_line(uid)}")
+        hidden_new = len(ranked_new) - 10
+        if hidden_new > 0:
+            hidden_rev = sum(float(x.get("today_revenue_usd") or 0) for x in ranked_new[10:])
+            out.append(f"_+{plural(hidden_new, 'more new payer')} · {usd(hidden_rev)} combined_")
+    else:
+        out.append("• No new payers today")
+
+    out += ["", "*Top Spenders*", ""]
+    if today_by_user:
+        payer_type = {r["user_id"]: r["payer_type"] for r in cohort}
+        for r in today_by_user[:10]:
+            uid = r["user_id"]
+            rev = float(r["revenue_usd"] or 0)
+            tag = "new" if payer_type.get(uid) == "new" else "returning"
+            out.append(f"• *`{uid}`* · {usd(rev)} (*{pct(rev, gross_rev)}%*) · "
+                       f"{plural(int(r['txns'] or 0), 'txn')} · {usd(r['avg_txn_usd'])} avg/txn · _{tag}_")
+    else:
+        out.append("• No data")
+    return out
+
+def recovery_detail():
+    if not blocked_detail:
+        return []
+    recovered = [b for b in blocked_detail if b.get("purchased_since")]
+    out = [f"*AML Wall — Recovery List* ({len(recovered)}/{len(blocked_detail)} have purchased since)", ""]
+    for b in blocked_detail[:MAX_BLOCKED_DETAIL]:
+        if b.get("purchased_since"):
+            state = "✅ purchased since"
+        elif b.get("cleared_aml"):
+            state = "⚠️ cleared AML, no purchase"
+        else:
+            state = "❌ still blocked"
+        out.append(f"• *`{b['user_id']}`* · {usd(b['intent_usd'])} intended · "
+                   f"{plural(int(b['attempts']), 'attempt')} · last {b['last_attempt_utc']} UTC · {state}")
+    hidden = len(blocked_detail) - MAX_BLOCKED_DETAIL
+    if hidden > 0:
+        hidden_usd = sum(float(x["intent_usd"] or 0) for x in blocked_detail[MAX_BLOCKED_DETAIL:])
+        out.append(f"_+{plural(hidden, 'more blocked user')} · {usd(hidden_usd)} combined_")
+    return out
+
 # ── Post to Slack ─────────────────────────────────────────────────────────────
+CHUNK_CHARS = 3500
+
+def post_thread(section_lines, thread_ts):
+    """Post a detail section into the thread, split on line boundaries if long."""
+    if not section_lines:
+        return
+    chunk = []
+    size = 0
+    for line in section_lines:
+        if size + len(line) + 1 > CHUNK_CHARS and chunk:
+            slack.chat_postMessage(channel=CHANNEL_ID, thread_ts=thread_ts, text="\n".join(chunk))
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        slack.chat_postMessage(channel=CHANNEL_ID, thread_ts=thread_ts, text="\n".join(chunk))
+
 try:
     resp = slack.chat_postMessage(channel=CHANNEL_ID, text=message)
     thread_ts = resp["ts"]
+
+    post_thread(returning_detail(), thread_ts)
+    post_thread(payers_detail(), thread_ts)
+    post_thread(recovery_detail(), thread_ts)
+
     if "revenue_trend" in charts:
         upload_chart(charts["revenue_trend"], f"trend_revenue_{DATE}.png", thread_ts,
                      "Captured vs blocked revenue, 7 days")
     if "funnel_trend" in charts:
         upload_chart(charts["funnel_trend"], f"trend_funnel_{DATE}.png", thread_ts,
                      "Daily funnel vs 7-day average")
+
     print(f"Report posted: https://secrethumans.slack.com/archives/{CHANNEL_ID}/p{thread_ts.replace('.','')}",
           flush=True)
 except Exception as e:
