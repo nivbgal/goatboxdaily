@@ -8,9 +8,15 @@ Tier movement: each run compares the tier BigQuery reports now against the `tier
 the Sheet recorded last run. A difference writes `previous_tier` + `tier_changed_at`
 and shows up in the "Tier moves today" section of the heat summary.
 
+Identity: first_name / last_name / email are carried forward from the Sheet by user_id.
+A blank email is filled from source_data.events; an email already in the Sheet is never
+overwritten. BigQuery has no name source, so names stay as entered by hand.
+
 Env vars required:
   GCP_SERVICE_ACCOUNT_JSON   full JSON of the GCP service account key
   SLACK_BOT_TOKEN            xoxb-... token with chat:write scope
+Optional:
+  DRY_RUN=1                  query and merge, print counts, but don't write the Sheet or post
 
 Sheet: 1OE2X6Cbg3a0CGO2oRy_uZ28GFt1yFZQmHdjSRbeX-nk (Sheet1)
 Slack: C0BAJM1T8LE (#vip)
@@ -119,6 +125,22 @@ WHERE crm.lifetime_purchases_usd >= 100
 ORDER BY crm.lifetime_purchases_usd DESC
 """
 
+# Purchase and balance events carry the account email as an event param. Checked
+# 2026-10-12: matched the CRM email for 30/30 new VIPs, one distinct email per user.
+# Filtered to the blank-email VIPs; events is clustered on (event_name, user_id).
+EMAIL_SQL = """
+SELECT
+  e.user_id,
+  ARRAY_AGG(TRIM(p.string_value) ORDER BY e.event_timestamp DESC LIMIT 1)[OFFSET(0)] AS email
+FROM `goatbox-prod.source_data.events` e, UNNEST(e.event_params) p
+WHERE p.key = 'email'
+  AND p.string_value IS NOT NULL
+  AND TRIM(p.string_value) != ''
+  AND e.event_name IN ('purchase_completed', 'purchase_initiated', 'balance_changed')
+  AND e.user_id IN UNNEST(@vip_user_ids)
+GROUP BY e.user_id
+"""
+
 
 # --- Scoring ---
 
@@ -198,6 +220,41 @@ def safe_str(val):
 
 def row_to_list(row_dict):
     return [str(row_dict.get(col, "") if row_dict.get(col, "") is not None else "") for col in COLUMNS]
+
+
+def fill_blank_emails(bq, merged_rows):
+    """Fill email from BigQuery where the Sheet has none. Mutates merged_rows.
+
+    Rows whose first_name is DELETED are skipped: BigQuery still holds emails for
+    deleted accounts and they must not be written back. Logs counts and user_ids
+    only, never emails.
+    """
+    blank = [
+        r for r in merged_rows
+        if not r["email"].strip() and r["first_name"].strip().upper() != "DELETED"
+    ]
+    if not blank:
+        print("  Emails: no blank rows to fill")
+        return
+
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ArrayQueryParameter("vip_user_ids", "STRING", [r["user_id"] for r in blank]),
+    ])
+    found = {
+        row["user_id"]: row["email"]
+        for row in bq.query(EMAIL_SQL, job_config=job_config).result()
+    }
+
+    still_blank = []
+    for r in blank:
+        if found.get(r["user_id"]):
+            r["email"] = found[r["user_id"]]
+        else:
+            still_blank.append(r["user_id"])
+
+    print(f"  Emails: filled {len(blank) - len(still_blank)}, still blank {len(still_blank)}")
+    if still_blank:
+        print(f"  Emails still blank for user_ids: {', '.join(still_blank)}")
 
 
 def post_error(slack, msg):
@@ -303,6 +360,7 @@ def main():
     sa_json_str = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
     slack_token = os.environ.get("SLACK_BOT_TOKEN")
     today_str = date.today().isoformat()
+    dry_run = os.environ.get("DRY_RUN") == "1"
 
     if not sa_json_str or not slack_token:
         print("ERROR: GCP_SERVICE_ACCOUNT_JSON and SLACK_BOT_TOKEN must be set", file=sys.stderr)
@@ -388,12 +446,22 @@ def main():
         row.update(compute_scores(row, today_str))
         merged_rows.append(row)
 
+    # A failed lookup leaves emails blank for a retry next run; it must not block the refresh.
+    try:
+        fill_blank_emails(bq, merged_rows)
+    except Exception as exc:
+        print(f"  WARNING: email fill skipped: {exc}", file=sys.stderr)
+
     n_up = sum(1 for r in merged_rows if r["_tier_move"] == "up")
     n_down = sum(1 for r in merged_rows if r["_tier_move"] == "down")
     print(f"  Tier moves since last run: {n_up} up, {n_down} down")
 
     # Sort ascending by hot_cold_score so coldest VIPs appear first in Sheet
     merged_rows.sort(key=lambda r: float(r.get("hot_cold_score") or 0))
+
+    if dry_run:
+        print(f"DRY RUN: would write {len(merged_rows)} rows; Sheet and Slack left untouched.")
+        return
 
     # --- 4. Write back to Sheet ---
     print(f"Writing {len(merged_rows)} rows to Sheet...")
