@@ -222,6 +222,31 @@ def row_to_list(row_dict):
     return [str(row_dict.get(col, "") if row_dict.get(col, "") is not None else "") for col in COLUMNS]
 
 
+def lookup_emails(bq, user_ids):
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ArrayQueryParameter("vip_user_ids", "STRING", list(user_ids)),
+    ])
+    return {
+        row["user_id"]: row["email"]
+        for row in bq.query(EMAIL_SQL, job_config=job_config).result()
+    }
+
+
+def check_email_source(bq, merged_rows):
+    """Dry-run only: compare BigQuery emails with those already in the Sheet. Counts only."""
+    filled = [r for r in merged_rows if r["email"].strip()]
+    found = lookup_emails(bq, [r["user_id"] for r in filled])
+    same = sum(
+        1 for r in filled
+        if found.get(r["user_id"], "").lower() == r["email"].strip().lower()
+    )
+    missing = sum(1 for r in filled if r["user_id"] not in found)
+    print(
+        f"  Email source check vs Sheet: {same} match, "
+        f"{len(filled) - same - missing} differ, {missing} not in BQ"
+    )
+
+
 def fill_blank_emails(bq, merged_rows):
     """Fill email from BigQuery where the Sheet has none. Mutates merged_rows.
 
@@ -237,13 +262,7 @@ def fill_blank_emails(bq, merged_rows):
         print("  Emails: no blank rows to fill")
         return
 
-    job_config = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ArrayQueryParameter("vip_user_ids", "STRING", [r["user_id"] for r in blank]),
-    ])
-    found = {
-        row["user_id"]: row["email"]
-        for row in bq.query(EMAIL_SQL, job_config=job_config).result()
-    }
+    found = lookup_emails(bq, [r["user_id"] for r in blank])
 
     still_blank = []
     for r in blank:
@@ -460,6 +479,7 @@ def main():
     merged_rows.sort(key=lambda r: float(r.get("hot_cold_score") or 0))
 
     if dry_run:
+        check_email_source(bq, merged_rows)
         print(f"DRY RUN: would write {len(merged_rows)} rows; Sheet and Slack left untouched.")
         return
 
