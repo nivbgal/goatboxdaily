@@ -4,6 +4,13 @@ Refreshes the GOATBox VIP roster in Google Sheets and posts a heat summary to #v
 
 Runs daily as a step in vip_report.yml, after the new-entrants report.
 
+Hot/Cold engine (spec: "Hot/Cold Engine" in docs/vip-program-spec.md):
+  recency_score  = days since Freya's last_contacted_at, 100 at day 0 down to 0 at day 30
+  context_score  = what the VIP did after that contact (see calc_context_score)
+  hot_cold_score = 0.5 x recency + 0.5 x context
+Never-contacted VIPs score 0 and are labelled Inactive. Rows whose first_name is
+DELETED stay in the Sheet (Freya's notes live there) but are left out of the report.
+
 Tier movement: each run compares the tier BigQuery reports now against the `tier`
 the Sheet recorded last run. A difference writes `previous_tier` + `tier_changed_at`
 and shows up in the "Tier moves today" section of the heat summary.
@@ -25,7 +32,7 @@ Slack: C0BAJM1T8LE (#vip)
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, datetime
 
 import gspread
 from google.cloud import bigquery
@@ -39,6 +46,21 @@ SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 
 # Voucher = this share of spend_last_30_days. No caps yet; add them in calc_voucher_usd.
 VOUCHER_RATE = 0.10
+
+# Hot/Cold engine. last_contacted_at is Freya's column, entered as MM/DD/YYYY.
+CONTACT_DATE_FORMAT = "%m/%d/%Y"
+RECENCY_WINDOW_DAYS = 30  # recency_score reaches 0 this many days after the last contact
+# context_score points, by what the VIP did after the last contact. Freya may retune these.
+CONTEXT_PURCHASED = 100
+CONTEXT_ACTIVE = 60  # logged in or opened a box, no purchase
+CONTEXT_NOTHING = 20
+CONTEXT_NEVER_CONTACTED = 0
+
+# Heat Report lists
+REPORT_LIST_LIMIT = 10
+NEEDS_ATTENTION_DAYS = 14  # contacted longer ago than this = needs attention
+BACK_ON_SITE_DAYS = 3  # on site within this many days...
+BACK_ON_SITE_NO_PURCHASE_DAYS = 30  # ...and no purchase for at least this many
 
 # Column groups - must stay in sync with COLUMNS order below
 AUTO_COLS = [
@@ -79,6 +101,19 @@ WITH crm_dedup AS (
   SELECT *
   FROM `goatbox-prod.processing_data.user_fact_crm`
   QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY last_purchase_at DESC) = 1
+),
+vip_activity AS (
+  -- From raw events because user_fact_crm.days_since_last_session lags: on 2026-10-12
+  -- it was stale for 41 of 149 VIPs, by up to 86 days.
+  SELECT
+    user_id,
+    DATE(MAX(event_timestamp)) AS last_session_date,
+    DATE(MAX(IF(event_name IN ('login_completed', 'boxes_opened'), event_timestamp, NULL))) AS last_active_date,
+    DATE(MAX(IF(event_name = 'purchase_completed', event_timestamp, NULL))) AS last_purchase_event_date
+  FROM `goatbox-prod.source_data.events`
+  WHERE event_name IN ('login_completed', 'boxes_opened', 'shop_opened', 'purchase_completed')
+    AND user_id IN (SELECT user_id FROM crm_dedup WHERE lifetime_purchases_usd >= 100)
+  GROUP BY user_id
 )
 SELECT
   crm.user_id,
@@ -91,7 +126,9 @@ SELECT
   CAST(crm.lifetime_purchases_usd AS FLOAT64) - COALESCE(oc.total_procurement_cost, 0) AS net_spend_usd,
   DATE(crm.last_purchase_at) AS last_purchase_date,
   crm.days_since_last_purchase,
-  crm.days_since_last_session,
+  DATE_DIFF(CURRENT_DATE(), va.last_session_date, DAY) AS days_since_last_session,
+  va.last_active_date,
+  va.last_purchase_event_date,
   crm.lifecycle_state,
   crm.total_purchases,
   ROUND(CAST(crm.lifetime_purchases_usd AS FLOAT64) / NULLIF(crm.total_purchases, 0), 2) AS avg_transaction_usd,
@@ -109,6 +146,7 @@ LEFT JOIN (
                                   AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
   GROUP BY user_id
 ) s30 ON s30.user_id = crm.user_id
+LEFT JOIN vip_activity va ON va.user_id = crm.user_id
 LEFT JOIN (
   SELECT
     o.user_id,
@@ -148,21 +186,39 @@ GROUP BY e.user_id
 
 # --- Scoring ---
 
-def calc_recency_score(days_since_last_session):
-    # [Certain] Higher = more recent. Hits 0 at 30 days of inactivity.
-    if days_since_last_session is None:
+def parse_contact_date(value):
+    """Freya's last_contacted_at as a date. Returns (date or None, unparseable)."""
+    text = str(value or "").strip()
+    if not text:
+        return None, False
+    try:
+        return datetime.strptime(text, CONTACT_DATE_FORMAT).date(), False
+    except ValueError:
+        return None, True
+
+
+def calc_recency_score(contact_date, today):
+    # 100 on the day of contact, straight line to 0 at RECENCY_WINDOW_DAYS. Never contacted = 0.
+    if contact_date is None:
         return 0.0
-    raw = 100.0 - (float(days_since_last_session) / 30.0) * 100.0
-    return round(max(0.0, raw), 1)
+    days = (today - contact_date).days
+    raw = 100.0 - (days / RECENCY_WINDOW_DAYS) * 100.0
+    return round(min(100.0, max(0.0, raw)), 1)
 
 
-def calc_context_score(row):
-    # [Certain] 70 if Freya left any conversation note, else 50.
-    has_notes = any(
-        str(row.get(f"conversation_note_{i}", "") or "").strip()
-        for i in range(1, 4)
-    )
-    return 70 if has_notes else 50
+def calc_context_score(contact_date, last_purchase_date, last_active_date):
+    """What the VIP did after Freya's last contact.
+
+    Dates are compared by day (the contact has no time), so activity on the day of
+    the contact counts as after it.
+    """
+    if contact_date is None:
+        return CONTEXT_NEVER_CONTACTED
+    if last_purchase_date and last_purchase_date >= contact_date:
+        return CONTEXT_PURCHASED
+    if last_active_date and last_active_date >= contact_date:
+        return CONTEXT_ACTIVE
+    return CONTEXT_NOTHING
 
 
 def calc_voucher_usd(spend_last_30_days):
@@ -172,8 +228,10 @@ def calc_voucher_usd(spend_last_30_days):
     return round(float(spend_last_30_days) * VOUCHER_RATE, 2)
 
 
-def calc_hot_cold_label(score):
-    # [Certain] Bucket boundaries from spec.
+def calc_hot_cold_label(score, contacted):
+    # Bucket boundaries from spec. Never contacted is always Inactive.
+    if not contacted:
+        return "Inactive"
     if score >= 70:
         return "Hot"
     if score >= 40:
@@ -206,16 +264,17 @@ def resolve_tier_change(new_tier, existing, is_new, today_str):
     }, ""
 
 
-def compute_scores(row, today_str):
-    rs = calc_recency_score(row.get("days_since_last_session"))
-    cs = calc_context_score(row)
+def compute_scores(row, today):
+    contact = row["_contact_date"]
+    rs = calc_recency_score(contact, today)
+    cs = calc_context_score(contact, row["_last_purchase_event_date"], row["_last_active_date"])
     hcs = round((rs * 0.5) + (cs * 0.5), 1)
     return {
         "recency_score": rs,
         "context_score": cs,
         "hot_cold_score": hcs,
-        "hot_cold_label": calc_hot_cold_label(hcs),
-        "score_updated": today_str,
+        "hot_cold_label": calc_hot_cold_label(hcs, contact is not None),
+        "score_updated": today.isoformat(),
     }
 
 
@@ -227,6 +286,51 @@ def safe_str(val):
     if hasattr(val, "isoformat"):
         return val.isoformat()
     return str(val)
+
+
+def is_deleted(row):
+    return str(row.get("first_name", "") or "").strip().upper() == "DELETED"
+
+
+def days_since(d, today):
+    return (today - d).days if d else None
+
+
+def build_report_lists(merged_rows, today):
+    """Rows for the Heat Report, DELETED accounts excluded. Lists are uncapped."""
+    live = [r for r in merged_rows if not is_deleted(r)]
+    by_ltv = lambda r: -float(r.get("ltv_usd") or 0)
+
+    never = sorted([r for r in live if r["_contact_date"] is None], key=by_ltv)
+    stale = sorted(
+        [r for r in live
+         if r["_contact_date"] is not None
+         and days_since(r["_contact_date"], today) > NEEDS_ATTENTION_DAYS],
+        key=by_ltv,
+    )
+
+    def back_on_site(r):
+        session = r.get("days_since_last_session")
+        purchase_days = days_since(r["_last_purchase_event_date"], today)
+        return (
+            session not in (None, "") and int(session) <= BACK_ON_SITE_DAYS
+            and (purchase_days is None or purchase_days >= BACK_ON_SITE_NO_PURCHASE_DAYS)
+        )
+
+    return {
+        "live": live,
+        "needs_attention": never + stale,
+        "n_never_contacted": len(never),
+        "back_on_site": sorted([r for r in live if back_on_site(r)], key=by_ltv),
+    }
+
+
+def label_counts(rows):
+    counts = {"Hot": 0, "Warm": 0, "Cold": 0, "Inactive": 0}
+    for r in rows:
+        label = str(r.get("hot_cold_label", "") or "")
+        counts[label] = counts.get(label, 0) + 1
+    return counts
 
 
 def row_to_list(row_dict):
@@ -299,26 +403,11 @@ def post_error(slack, msg):
 
 # --- Slack message ---
 
-def build_slack_message(merged_rows, today_str):
-    """Build the heat summary. merged_rows are pre-sorted ascending by hot_cold_score."""
-    counts = {"Hot": 0, "Warm": 0, "Cold": 0, "Inactive": 0}
-    for r in merged_rows:
-        label = r.get("hot_cold_label", "Inactive")
-        counts[label] = counts.get(label, 0) + 1
-
-    # Top 5 Cold/Inactive VIPs where Freya has not yet made contact
-    needs_attention = [
-        r for r in merged_rows
-        if r.get("hot_cold_label") in ("Cold", "Inactive")
-        and str(r.get("relationship_stage", "")).strip() == "new"
-    ][:5]
-
-    # All Hot VIPs sorted desc by score for readability
-    hot_vips = sorted(
-        [r for r in merged_rows if r.get("hot_cold_label") == "Hot"],
-        key=lambda r: float(r.get("hot_cold_score") or 0),
-        reverse=True,
-    )
+def build_slack_message(merged_rows, today):
+    lists = build_report_lists(merged_rows, today)
+    live = lists["live"]
+    counts = label_counts(live)
+    n_deleted = len(merged_rows) - len(live)
 
     def fmt_ltv(r):
         try:
@@ -326,8 +415,27 @@ def build_slack_message(merged_rows, today_str):
         except (ValueError, TypeError):
             return str(r.get("ltv_usd", ""))
 
+    def capped(rows, fmt):
+        out = [fmt(r) for r in rows[:REPORT_LIST_LIMIT]] or ["- None"]
+        if len(rows) > REPORT_LIST_LIMIT:
+            out.append(f"- ...and {len(rows) - REPORT_LIST_LIMIT} more in the Sheet")
+        return out
+
+    def fmt_attention(r):
+        contact = r["_contact_date"]
+        when = "never contacted" if contact is None else f"last contact {days_since(contact, today)}d ago"
+        return f"- `{r['user_id']}` | {r.get('tier', '')} | {fmt_ltv(r)} | {when}"
+
+    def fmt_back(r):
+        purchase_days = days_since(r["_last_purchase_event_date"], today)
+        bought = "no purchase on record" if purchase_days is None else f"last purchase {purchase_days}d ago"
+        return (
+            f"- `{r['user_id']}` | {r.get('tier', '')} | {fmt_ltv(r)} | "
+            f"on site {r.get('days_since_last_session')}d ago | {bought}"
+        )
+
     lines = [
-        f":thermometer: *VIP Heat Report - {today_str}*",
+        f":thermometer: *VIP Heat Report - {today.isoformat()}*",
         "",
         (
             f":fire: Hot: {counts['Hot']} | "
@@ -335,23 +443,24 @@ def build_slack_message(merged_rows, today_str):
             f":snowflake: Cold: {counts['Cold']} | "
             f":black_square_button: Inactive: {counts['Inactive']}"
         ),
-        f"Total VIPs: {len(merged_rows)}",
+        f"Total VIPs: {len(live)}" + (f" (excludes {n_deleted} deleted)" if n_deleted else ""),
         "",
-        "*Needs attention (Cold/Inactive, not yet contacted):*",
+        (
+            f"*Needs attention ({lists['n_never_contacted']} never contacted, then last contact "
+            f"over {NEEDS_ATTENTION_DAYS}d ago):*"
+        ),
+        *capped(lists["needs_attention"], fmt_attention),
+        "",
+        (
+            f"*Back on site, not buying (on site in the last {BACK_ON_SITE_DAYS}d, "
+            f"no purchase in {BACK_ON_SITE_NO_PURCHASE_DAYS}d+):*"
+        ),
+        *capped(lists["back_on_site"], fmt_back),
     ]
-
-    if needs_attention:
-        for r in needs_attention:
-            lines.append(
-                f"- `{r['user_id']}` | {r.get('tier', '')} | "
-                f"{fmt_ltv(r)} | {r.get('days_since_last_session', '?')}d since last session"
-            )
-    else:
-        lines.append("- None")
 
     # Tier moves detected this run, biggest new tier first
     tier_moves = sorted(
-        [r for r in merged_rows if r.get("_tier_move") in ("up", "down")],
+        [r for r in live if r.get("_tier_move") in ("up", "down")],
         key=lambda r: (TIER_RANK.get(r.get("tier", ""), 0), float(r.get("ltv_usd") or 0)),
         reverse=True,
     )
@@ -367,6 +476,12 @@ def build_slack_message(merged_rows, today_str):
             )
     else:
         lines.append("- None")
+
+    hot_vips = sorted(
+        [r for r in live if r.get("hot_cold_label") == "Hot"],
+        key=lambda r: float(r.get("hot_cold_score") or 0),
+        reverse=True,
+    )
 
     lines += ["", "*Hot VIPs (score >= 70):*"]
 
@@ -384,12 +499,48 @@ def build_slack_message(merged_rows, today_str):
     return "\n".join(lines)
 
 
+def print_dry_run_summary(merged_rows, existing_by_uid, today):
+    """Counts and user_ids only: no names or emails."""
+    lists = build_report_lists(merged_rows, today)
+    live = lists["live"]
+    before = label_counts(
+        existing_by_uid[r["user_id"]] for r in live if r["user_id"] in existing_by_uid
+    )
+    after = label_counts(live)
+    print(f"  Labels before (Sheet, excl. deleted): {before}")
+    print(f"  Labels after:                         {after}")
+
+    contacted = sorted(r["_contact_date"] for r in live if r["_contact_date"] is not None)
+    if contacted:
+        median_days = days_since(contacted[len(contacted) // 2], today)
+        print(
+            f"  Contacted {len(contacted)} of {len(live)}: contact dates {contacted[0]} to "
+            f"{contacted[-1]}, median {median_days}d ago. Recency hits 0 at "
+            f"{RECENCY_WINDOW_DAYS}d, so old contacts drive most rows to Cold/Inactive: "
+            "that is the real state, not a bug."
+        )
+    print(
+        f"  Needs attention ({len(lists['needs_attention'])}, first "
+        f"{lists['n_never_contacted']} never contacted, Slack shows {REPORT_LIST_LIMIT}): "
+        + ", ".join(r["user_id"] for r in lists["needs_attention"])
+    )
+    print(
+        f"  Back on site, not buying ({len(lists['back_on_site'])}): "
+        + ", ".join(r["user_id"] for r in lists["back_on_site"])
+    )
+    deleted_in_lists = [
+        r["user_id"] for r in lists["needs_attention"] + lists["back_on_site"] if is_deleted(r)
+    ]
+    print(f"  DELETED rows in lists: {len(deleted_in_lists)}")
+
+
 # --- Main ---
 
 def main():
     sa_json_str = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
     slack_token = os.environ.get("SLACK_BOT_TOKEN")
-    today_str = date.today().isoformat()
+    today = date.today()
+    today_str = today.isoformat()
     dry_run = os.environ.get("DRY_RUN") == "1"
 
     if not sa_json_str or not slack_token:
@@ -447,6 +598,7 @@ def main():
 
     # --- 3. Merge BQ data with existing Sheet rows ---
     merged_rows = []
+    bad_contact_dates = []
 
     for bq_row in bq_rows:
         uid = str(bq_row.get("user_id", ""))
@@ -460,9 +612,12 @@ def main():
 
         row["voucher_usd"] = safe_str(calc_voucher_usd(bq_row.get("spend_last_30_days")))
 
-        # Identity cols: preserved from Sheet; blank for VIPs not yet in Sheet
+        # Identity cols: preserved from Sheet; blank for VIPs not yet in Sheet.
+        # Names are trimmed of stray spaces; nothing else in them is changed.
         for col in IDENTITY_COLS:
             row[col] = str(existing.get(col, "") or "")
+            if col in ("first_name", "last_name"):
+                row[col] = row[col].strip()
 
         # Freya cols: NEVER overwrite. New VIPs get relationship_stage="new", rest blank.
         for col in FREYA_COLS:
@@ -475,8 +630,22 @@ def main():
         row.update(tier_fields)
         row["_tier_move"] = move  # transient, not in COLUMNS so never written to the Sheet
 
-        row.update(compute_scores(row, today_str))
+        # Transient fields for scoring and the report; not in COLUMNS, never written.
+        row["_contact_date"], bad_date = parse_contact_date(row["last_contacted_at"])
+        if bad_date:
+            bad_contact_dates.append(uid)
+        row["_last_active_date"] = bq_row.get("last_active_date")
+        row["_last_purchase_event_date"] = bq_row.get("last_purchase_event_date")
+
+        row.update(compute_scores(row, today))
         merged_rows.append(row)
+
+    if bad_contact_dates:
+        print(
+            f"  WARNING: last_contacted_at not MM/DD/YYYY for {len(bad_contact_dates)} rows, "
+            f"scored as never contacted: {', '.join(bad_contact_dates)}",
+            file=sys.stderr,
+        )
 
     # A failed lookup leaves emails blank for a retry next run; it must not block the refresh.
     try:
@@ -484,7 +653,10 @@ def main():
     except Exception as exc:
         print(f"  WARNING: email fill skipped: {exc}", file=sys.stderr)
 
-    vouchers = [float(r["voucher_usd"]) for r in merged_rows if r["voucher_usd"] != ""]
+    vouchers = [
+        float(r["voucher_usd"]) for r in merged_rows
+        if r["voucher_usd"] != "" and not is_deleted(r)
+    ]
     paying = [v for v in vouchers if v > 0]
     print(
         f"  Vouchers: {len(paying)} rows above 0, "
@@ -500,6 +672,7 @@ def main():
 
     if dry_run:
         check_email_source(bq, merged_rows)
+        print_dry_run_summary(merged_rows, existing_by_uid, today)
         print(f"DRY RUN: would write {len(merged_rows)} rows; Sheet and Slack left untouched.")
         return
 
@@ -521,7 +694,7 @@ def main():
 
     # --- 5. Post heat summary to Slack #vip ---
     print("Posting heat summary to #vip...")
-    msg = build_slack_message(merged_rows, today_str)
+    msg = build_slack_message(merged_rows, today)
 
     try:
         resp = slack.chat_postMessage(
