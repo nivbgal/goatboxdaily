@@ -37,6 +37,9 @@ SHEET_ID = "1OE2X6Cbg3a0CGO2oRy_uZ28GFt1yFZQmHdjSRbeX-nk"
 SLACK_CHANNEL = "C0BAJM1T8LE"  # #vip
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 
+# Voucher = this share of spend_last_30_days. No caps yet; add them in calc_voucher_usd.
+VOUCHER_RATE = 0.10
+
 # Column groups - must stay in sync with COLUMNS order below
 AUTO_COLS = [
     "user_id", "tier", "ltv_usd", "net_spend_usd", "last_purchase_date",
@@ -44,6 +47,7 @@ AUTO_COLS = [
     "total_purchases", "avg_transaction_usd", "country", "favorite_box_category",
     "spend_last_30_days",
 ]
+VOUCHER_COLS = ["voucher_usd"]  # derived from spend_last_30_days, not from BQ
 IDENTITY_COLS = ["first_name", "last_name", "email"]
 FREYA_COLS = [
     "preferred_channel", "relationship_stage", "last_contacted_at",
@@ -63,7 +67,7 @@ COLUMNS = [
     "recency_score", "context_score", "hot_cold_score", "hot_cold_label", "score_updated",
     "previous_tier", "tier_changed_at",
     # Appended last, like the tier history cols, so Freya's column positions don't shift.
-    "spend_last_30_days",
+    "spend_last_30_days", "voucher_usd",
 ]
 
 TIER_RANK = {"VIP": 1, "Gold": 2, "GOAT": 3}
@@ -159,6 +163,13 @@ def calc_context_score(row):
         for i in range(1, 4)
     )
     return 70 if has_notes else 50
+
+
+def calc_voucher_usd(spend_last_30_days):
+    # Blank spend stays blank; 0 spend gives a 0 voucher.
+    if spend_last_30_days in (None, ""):
+        return ""
+    return round(float(spend_last_30_days) * VOUCHER_RATE, 2)
 
 
 def calc_hot_cold_label(score):
@@ -447,6 +458,8 @@ def main():
         for col in AUTO_COLS:
             row[col] = safe_str(bq_row.get(col))
 
+        row["voucher_usd"] = safe_str(calc_voucher_usd(bq_row.get("spend_last_30_days")))
+
         # Identity cols: preserved from Sheet; blank for VIPs not yet in Sheet
         for col in IDENTITY_COLS:
             row[col] = str(existing.get(col, "") or "")
@@ -470,6 +483,13 @@ def main():
         fill_blank_emails(bq, merged_rows)
     except Exception as exc:
         print(f"  WARNING: email fill skipped: {exc}", file=sys.stderr)
+
+    vouchers = [float(r["voucher_usd"]) for r in merged_rows if r["voucher_usd"] != ""]
+    paying = [v for v in vouchers if v > 0]
+    print(
+        f"  Vouchers: {len(paying)} rows above 0, "
+        f"total ${sum(paying):,.2f}, max ${max(paying, default=0):,.2f}"
+    )
 
     n_up = sum(1 for r in merged_rows if r["_tier_move"] == "up")
     n_down = sum(1 for r in merged_rows if r["_tier_move"] == "down")
