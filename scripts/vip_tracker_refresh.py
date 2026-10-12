@@ -36,6 +36,7 @@ AUTO_COLS = [
     "user_id", "tier", "ltv_usd", "net_spend_usd", "last_purchase_date",
     "days_since_last_purchase", "days_since_last_session", "lifecycle_state",
     "total_purchases", "avg_transaction_usd", "country", "favorite_box_category",
+    "spend_last_30_days",
 ]
 IDENTITY_COLS = ["first_name", "last_name", "email"]
 FREYA_COLS = [
@@ -55,6 +56,8 @@ COLUMNS = [
     "conversation_note_1", "conversation_note_2", "conversation_note_3", "manager_notes",
     "recency_score", "context_score", "hot_cold_score", "hot_cold_label", "score_updated",
     "previous_tier", "tier_changed_at",
+    # Appended last, like the tier history cols, so Freya's column positions don't shift.
+    "spend_last_30_days",
 ]
 
 TIER_RANK = {"VIP": 1, "Gold": 2, "GOAT": 3}
@@ -83,8 +86,19 @@ SELECT
   crm.total_purchases,
   ROUND(CAST(crm.lifetime_purchases_usd AS FLOAT64) / NULLIF(crm.total_purchases, 0), 2) AS avg_transaction_usd,
   crm.country,
-  crm.favorite_box_category
+  crm.favorite_box_category,
+  -- Gross purchases over the last 30 complete UTC days (yesterday back 30), the base
+  -- for the 10%-of-30-day-spend voucher rule. Not user_fact_crm.d30_purchases_usd,
+  -- which is the first 30 days after registration.
+  CAST(COALESCE(s30.spend_last_30_days, 0) AS FLOAT64) AS spend_last_30_days
 FROM crm_dedup crm
+LEFT JOIN (
+  SELECT user_id, SUM(amount_usd) AS spend_last_30_days
+  FROM `goatbox-prod.processing_data.flat_purchase_events`
+  WHERE DATE(event_timestamp) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+                                  AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+  GROUP BY user_id
+) s30 ON s30.user_id = crm.user_id
 LEFT JOIN (
   SELECT
     o.user_id,
@@ -385,6 +399,9 @@ def main():
     print(f"Writing {len(merged_rows)} rows to Sheet...")
     output = [COLUMNS] + [row_to_list(r) for r in merged_rows]
     try:
+        # ws.update() fails if the grid is narrower than COLUMNS.
+        if ws.col_count < len(COLUMNS):
+            ws.add_cols(len(COLUMNS) - ws.col_count)
         ws.clear()
         ws.update(output, "A1", value_input_option="USER_ENTERED")
         print("  Sheet updated.")
