@@ -44,7 +44,8 @@ SHEET_ID = "1OE2X6Cbg3a0CGO2oRy_uZ28GFt1yFZQmHdjSRbeX-nk"
 SLACK_CHANNEL = "C0BAJM1T8LE"  # #vip
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 
-# Voucher = this share of spend_last_30_days. No caps yet; add them in calc_voucher_usd.
+# Voucher = this share of spend_last_30_days, never below 0. No caps yet; add them in
+# calc_voucher_usd.
 VOUCHER_RATE = 0.10
 
 # Hot/Cold engine. last_contacted_at is Freya's column, entered as MM/DD/YYYY.
@@ -82,14 +83,13 @@ TIER_HISTORY_COLS = ["previous_tier", "tier_changed_at"]
 
 COLUMNS = [
     "user_id", "first_name", "last_name", "email", "tier", "ltv_usd", "net_spend_usd",
+    "spend_last_30_days", "voucher_usd",
     "last_purchase_date", "days_since_last_purchase", "days_since_last_session",
     "lifecycle_state", "total_purchases", "avg_transaction_usd", "country",
     "favorite_box_category", "preferred_channel", "relationship_stage", "last_contacted_at",
     "conversation_note_1", "conversation_note_2", "conversation_note_3", "manager_notes",
     "recency_score", "context_score", "hot_cold_score", "hot_cold_label", "score_updated",
     "previous_tier", "tier_changed_at",
-    # Appended last, like the tier history cols, so Freya's column positions don't shift.
-    "spend_last_30_days", "voucher_usd",
 ]
 
 TIER_RANK = {"VIP": 1, "Gold": 2, "GOAT": 3}
@@ -134,18 +134,28 @@ SELECT
   ROUND(CAST(crm.lifetime_purchases_usd AS FLOAT64) / NULLIF(crm.total_purchases, 0), 2) AS avg_transaction_usd,
   crm.country,
   crm.favorite_box_category,
-  -- Gross purchases over the last 30 complete UTC days (yesterday back 30), the base
-  -- for the 10%-of-30-day-spend voucher rule. Not user_fact_crm.d30_purchases_usd,
-  -- which is the first 30 days after registration.
-  CAST(COALESCE(s30.spend_last_30_days, 0) AS FLOAT64) AS spend_last_30_days
+  -- Purchases minus refunds over the last 30 days (rolling from now), the base for
+  -- the 10%-of-30-day-spend voucher rule. Can go below 0 when a refund in the window
+  -- is for an older purchase. Not user_fact_crm.d30_purchases_usd, which is the
+  -- first 30 days after registration.
+  CAST(COALESCE(p30.purchases_usd, 0) - COALESCE(r30.refunds_usd, 0) AS FLOAT64) AS spend_last_30_days
 FROM crm_dedup crm
 LEFT JOIN (
-  SELECT user_id, SUM(amount_usd) AS spend_last_30_days
+  SELECT user_id, SUM(amount_usd) AS purchases_usd
   FROM `goatbox-prod.processing_data.flat_purchase_events`
-  WHERE DATE(event_timestamp) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-                                  AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+  WHERE event_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
   GROUP BY user_id
-) s30 ON s30.user_id = crm.user_id
+) p30 ON p30.user_id = crm.user_id
+LEFT JOIN (
+  -- Each refund is logged once per status (new, processing, succeeded), so count only
+  -- succeeded or the refund is subtracted three times. amount is USD (currency checked
+  -- 2026-10-14: every row is USD).
+  SELECT user_id, SUM(amount) AS refunds_usd
+  FROM `goatbox-prod.processing_data.flat_payment_refunded`
+  WHERE status = 'succeeded'
+    AND event_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+  GROUP BY user_id
+) r30 ON r30.user_id = crm.user_id
 LEFT JOIN vip_activity va ON va.user_id = crm.user_id
 LEFT JOIN (
   SELECT
@@ -222,10 +232,10 @@ def calc_context_score(contact_date, last_purchase_date, last_active_date):
 
 
 def calc_voucher_usd(spend_last_30_days):
-    # Blank spend stays blank; 0 spend gives a 0 voucher.
+    # Blank spend stays blank; 0 or negative spend (refunds over purchases) gives 0.
     if spend_last_30_days in (None, ""):
         return ""
-    return round(float(spend_last_30_days) * VOUCHER_RATE, 2)
+    return round(max(0.0, float(spend_last_30_days)) * VOUCHER_RATE, 2)
 
 
 def calc_hot_cold_label(score, contacted):
@@ -244,7 +254,7 @@ def calc_hot_cold_label(score, contacted):
 def resolve_tier_change(new_tier, existing, is_new, today_str):
     """Compare the tier BQ reports now against the tier the Sheet recorded last run.
 
-    Returns (fields_to_write, move) where move is "up" / "down" / "new" / "" — move is
+    Returns (fields_to_write, move) where move is "up" / "down" / "new" / "". move is
     only for today's Slack summary and is never written to the Sheet.
     """
     sheet_tier = str(existing.get("tier", "") or "").strip()
@@ -257,7 +267,7 @@ def resolve_tier_change(new_tier, existing, is_new, today_str):
         move = "up" if TIER_RANK.get(new_tier, 0) > TIER_RANK.get(sheet_tier, 0) else "down"
         return {"previous_tier": sheet_tier, "tier_changed_at": today_str}, move
 
-    # No change today — carry forward whatever the last move was.
+    # No change today: carry forward whatever the last move was.
     return {
         "previous_tier": str(existing.get("previous_tier", "") or ""),
         "tier_changed_at": str(existing.get("tier_changed_at", "") or ""),
