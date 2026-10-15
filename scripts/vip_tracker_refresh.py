@@ -96,13 +96,15 @@ TIER_HISTORY_COLS = ["previous_tier", "tier_changed_at"]
 
 COLUMNS = [
     "user_id", "first_name", "last_name", "email", "tier", "ltv_usd", "net_spend_usd",
-    "spend_last_30_days", "voucher_usd", "gifts_total_usd", "gifts_last_30_days_usd",
+    "spend_last_30_days", "voucher_usd",
     "last_purchase_date", "days_since_last_purchase", "days_since_last_session",
     "lifecycle_state", "total_purchases", "avg_transaction_usd", "country",
     "favorite_box_category", "preferred_channel", "relationship_stage", "last_contacted_at",
     "conversation_note_1", "conversation_note_2", "conversation_note_3", "manager_notes",
     "recency_score", "context_score", "hot_cold_score", "hot_cold_label", "score_updated",
     "previous_tier", "tier_changed_at",
+    # Appended last, where Freya first put them, so none of her columns move.
+    "gifts_total_usd", "gifts_last_30_days_usd",
 ]
 
 TIER_RANK = {"VIP": 1, "Gold": 2, "GOAT": 3}
