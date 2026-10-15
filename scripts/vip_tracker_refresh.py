@@ -19,6 +19,13 @@ Identity: first_name / last_name / email are carried forward from the Sheet by u
 A blank email is filled from source_data.events; an email already in the Sheet is never
 overwritten. BigQuery has no name source, so names stay as entered by hand.
 
+Gifts: gifts_total_usd and gifts_last_30_days_usd are summed per user_id from the
+"Gifts log" tab. Freya owns that tab: the job reads it and never writes to it.
+
+Extra columns: a main-tab column that is neither a job column nor a Freya column is
+carried forward by user_id under the same header, after all known columns. Formula
+cells keep their formula.
+
 Env vars required:
   GCP_SERVICE_ACCOUNT_JSON   full JSON of the GCP service account key
   SLACK_BOT_TOKEN            xoxb-... token with chat:write scope
@@ -32,7 +39,7 @@ Slack: C0BAJM1T8LE (#vip)
 import json
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import gspread
 from google.cloud import bigquery
@@ -47,6 +54,11 @@ SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 # Voucher = this share of spend_last_30_days, never below 0. No caps yet; add them in
 # calc_voucher_usd.
 VOUCHER_RATE = 0.10
+
+# Gifts log tab, typed by hand by Freya. Read by header name, never written.
+GIFTS_TAB = "Gifts log"
+GIFTS_WINDOW_DAYS = 30  # same window as spend_last_30_days
+GIFT_DATE_FORMATS = ("%d %b %Y", "%m/%d/%Y", "%Y-%m-%d")  # "07 Sep 2026" is what she types
 
 # Hot/Cold engine. last_contacted_at is Freya's column, entered as MM/DD/YYYY.
 CONTACT_DATE_FORMAT = "%m/%d/%Y"
@@ -71,6 +83,7 @@ AUTO_COLS = [
     "spend_last_30_days",
 ]
 VOUCHER_COLS = ["voucher_usd"]  # derived from spend_last_30_days, not from BQ
+GIFT_COLS = ["gifts_total_usd", "gifts_last_30_days_usd"]  # summed from the Gifts log tab
 IDENTITY_COLS = ["first_name", "last_name", "email"]
 FREYA_COLS = [
     "preferred_channel", "relationship_stage", "last_contacted_at",
@@ -83,7 +96,7 @@ TIER_HISTORY_COLS = ["previous_tier", "tier_changed_at"]
 
 COLUMNS = [
     "user_id", "first_name", "last_name", "email", "tier", "ltv_usd", "net_spend_usd",
-    "spend_last_30_days", "voucher_usd",
+    "spend_last_30_days", "voucher_usd", "gifts_total_usd", "gifts_last_30_days_usd",
     "last_purchase_date", "days_since_last_purchase", "days_since_last_session",
     "lifecycle_state", "total_purchases", "avg_transaction_usd", "country",
     "favorite_box_category", "preferred_channel", "relationship_stage", "last_contacted_at",
@@ -347,6 +360,126 @@ def row_to_list(row_dict):
     return [str(row_dict.get(col, "") if row_dict.get(col, "") is not None else "") for col in COLUMNS]
 
 
+def parse_gift_date(value):
+    text = str(value or "").strip()
+    for fmt in GIFT_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def read_gifts_log(spreadsheet, today):
+    """Sum the Gifts log per user_id. Returns (totals, rows_by_uid), or (None, {}) if
+    the tab or a needed header is missing. Read only: Freya owns this tab.
+
+    totals maps user_id -> (gifts_total_usd, gifts_last_30_days_usd). Problem rows are
+    logged by Sheet row number, never by name.
+    """
+    try:
+        gws = spreadsheet.worksheet(GIFTS_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"  WARNING: no '{GIFTS_TAB}' tab, gift columns left blank", file=sys.stderr)
+        return None, {}
+
+    values = gws.get_all_values()
+    if not values:
+        return {}, {}
+    header = [h.strip().lower() for h in values[0]]
+    needed = ("date", "user_id", "amount_usd")
+    missing = [h for h in needed if h not in header]
+    if missing:
+        print(
+            f"  WARNING: '{GIFTS_TAB}' has no {', '.join(missing)} header, gift columns left blank",
+            file=sys.stderr,
+        )
+        return None, {}
+    i_date, i_uid, i_amt = (header.index(h) for h in needed)
+    i_type = header.index("type") if "type" in header else None
+
+    cutoff = today - timedelta(days=GIFTS_WINDOW_DAYS)
+    totals, rows_by_uid = {}, {}
+    bad_amount, bad_date, no_uid = [], [], []
+
+    for n, row in enumerate(values[1:], start=2):
+        cell = lambda i: row[i].strip() if i is not None and i < len(row) else ""
+        uid, amt_text, date_text = cell(i_uid), cell(i_amt), cell(i_date)
+        if not (uid or amt_text or date_text):
+            continue
+        if not uid:
+            no_uid.append(n)
+            continue
+        try:
+            amount = float(amt_text.replace("$", "").replace(",", ""))
+        except ValueError:
+            amount = 0.0
+            bad_amount.append(n)
+        gift_date = parse_gift_date(date_text)
+        if gift_date is None:
+            bad_date.append(n)  # still counts in the total, not in the 30-day sum
+
+        total, last30 = totals.get(uid, (0.0, 0.0))
+        in_window = gift_date is not None and gift_date >= cutoff
+        totals[uid] = (total + amount, last30 + (amount if in_window else 0.0))
+        rows_by_uid.setdefault(uid, []).append((n, date_text, amount, cell(i_type)))
+
+    print(f"  Gifts log: {sum(len(r) for r in rows_by_uid.values())} rows, {len(totals)} user_ids")
+    for label, rows in (
+        ("blank or non-numeric amount_usd, counted as 0", bad_amount),
+        ("unreadable date, left out of the 30-day sum", bad_date),
+        ("no user_id, skipped", no_uid),
+    ):
+        if rows:
+            print(f"  WARNING: Gifts log rows with {label}: {', '.join(map(str, rows))}", file=sys.stderr)
+
+    return totals, rows_by_uid
+
+
+def read_extra_columns(ws):
+    """Columns on the main tab the job does not own, by header, keyed on user_id.
+
+    Returns (extra_headers, values_by_uid). A formula cell keeps its formula; any
+    other cell keeps its displayed value. Order follows the Sheet.
+    """
+    shown = ws.get_all_values()
+    if not shown:
+        return [], {}
+    formulas = ws.get_all_values(value_render_option="FORMULA")
+    header = shown[0]
+    if "user_id" not in header:
+        return [], {}
+    i_uid = header.index("user_id")
+
+    extra_idx = [i for i, h in enumerate(header) if h.strip() and h.strip() not in COLUMNS]
+    unnamed = [
+        gspread.utils.rowcol_to_a1(1, i + 1).rstrip("1")
+        for i, h in enumerate(header)
+        if not h.strip() and any(i < len(r) and r[i].strip() for r in shown[1:])
+    ]
+    if unnamed:
+        print(
+            f"  WARNING: main-tab columns with data but no header are not kept: {', '.join(unnamed)}",
+            file=sys.stderr,
+        )
+
+    def cell(grid, r, i):
+        return grid[r][i] if r < len(grid) and i < len(grid[r]) else ""
+
+    values_by_uid = {}
+    for r in range(1, len(shown)):
+        uid = str(cell(shown, r, i_uid)).strip()
+        if not uid:
+            continue
+        kept = []
+        for i in extra_idx:
+            f = cell(formulas, r, i)
+            kept.append(f if isinstance(f, str) and f.startswith("=") else cell(shown, r, i))
+        values_by_uid[uid] = kept
+
+    return [header[i].strip() for i in extra_idx], values_by_uid
+
+
 def lookup_emails(bq, user_ids):
     job_config = bigquery.QueryJobConfig(query_parameters=[
         bigquery.ArrayQueryParameter("vip_user_ids", "STRING", list(user_ids)),
@@ -509,6 +642,18 @@ def build_slack_message(merged_rows, today):
     return "\n".join(lines)
 
 
+def print_gift_sample(merged_rows, gift_rows, n=5):
+    """Dry-run only: gift totals for a few user_ids with the log rows behind them."""
+    sample = [r for r in merged_rows if r["user_id"] in gift_rows][:n]
+    for r in sample:
+        print(
+            f"  Gifts {r['user_id']}: total {r['gifts_total_usd']}, "
+            f"last {GIFTS_WINDOW_DAYS}d {r['gifts_last_30_days_usd']}"
+        )
+        for row_num, date_text, amount, gift_type in gift_rows[r["user_id"]]:
+            print(f"      log row {row_num}: {date_text} | {amount:.2f} | {gift_type}")
+
+
 def print_dry_run_summary(merged_rows, existing_by_uid, today):
     """Counts and user_ids only: no names or emails."""
     lists = build_report_lists(merged_rows, today)
@@ -596,15 +741,28 @@ def main():
         ],
     )
     gc = gspread.authorize(sheets_creds)
-    ws = gc.open_by_key(SHEET_ID).get_worksheet(0)
+    spreadsheet = gc.open_by_key(SHEET_ID)
+    ws = spreadsheet.get_worksheet(0)
 
-    existing_data = ws.get_all_records(default_blank="")
+    # Nothing is written yet, so a failed read stops the run with the Sheet untouched.
+    try:
+        existing_data = ws.get_all_records(default_blank="")
+        extra_headers, extra_by_uid = read_extra_columns(ws)
+        gift_totals, gift_rows = read_gifts_log(spreadsheet, today)
+    except Exception as exc:
+        msg = f"Sheet read failed, nothing written: {exc}"
+        print(msg, file=sys.stderr)
+        post_error(slack, msg)
+        sys.exit(1)
+
     existing_by_uid = {
         str(r.get("user_id", "")): r
         for r in existing_data
         if r.get("user_id")
     }
     print(f"  Sheet has {len(existing_by_uid)} existing rows")
+    if extra_headers:
+        print(f"  Keeping {len(extra_headers)} extra columns: {', '.join(extra_headers)}")
 
     # --- 3. Merge BQ data with existing Sheet rows ---
     merged_rows = []
@@ -621,6 +779,13 @@ def main():
             row[col] = safe_str(bq_row.get(col))
 
         row["voucher_usd"] = safe_str(calc_voucher_usd(bq_row.get("spend_last_30_days")))
+
+        if gift_totals is None:
+            row["gifts_total_usd"] = row["gifts_last_30_days_usd"] = ""
+        else:
+            total, last30 = gift_totals.get(uid, (0.0, 0.0))
+            row["gifts_total_usd"] = safe_str(round(total, 2))
+            row["gifts_last_30_days_usd"] = safe_str(round(last30, 2))
 
         # Identity cols: preserved from Sheet; blank for VIPs not yet in Sheet.
         # Names are trimmed of stray spaces; nothing else in them is changed.
@@ -657,6 +822,15 @@ def main():
             file=sys.stderr,
         )
 
+    if gift_totals:
+        roster = {r["user_id"] for r in merged_rows}
+        off_roster = sorted(u for u in gift_totals if u not in roster)
+        if off_roster:
+            print(
+                f"  WARNING: Gifts log user_ids not on the main tab, skipped: {', '.join(off_roster)}",
+                file=sys.stderr,
+            )
+
     # A failed lookup leaves emails blank for a retry next run; it must not block the refresh.
     try:
         fill_blank_emails(bq, merged_rows)
@@ -683,16 +857,21 @@ def main():
     if dry_run:
         check_email_source(bq, merged_rows)
         print_dry_run_summary(merged_rows, existing_by_uid, today)
+        print_gift_sample(merged_rows, gift_rows)
         print(f"DRY RUN: would write {len(merged_rows)} rows; Sheet and Slack left untouched.")
         return
 
     # --- 4. Write back to Sheet ---
     print(f"Writing {len(merged_rows)} rows to Sheet...")
-    output = [COLUMNS] + [row_to_list(r) for r in merged_rows]
+    # Extra columns go after every known column; a new VIP gets blanks in them.
+    blank_extras = [""] * len(extra_headers)
+    output = [COLUMNS + extra_headers] + [
+        row_to_list(r) + extra_by_uid.get(r["user_id"], blank_extras) for r in merged_rows
+    ]
     try:
-        # ws.update() fails if the grid is narrower than COLUMNS.
-        if ws.col_count < len(COLUMNS):
-            ws.add_cols(len(COLUMNS) - ws.col_count)
+        # ws.update() fails if the grid is narrower than the output.
+        if ws.col_count < len(output[0]):
+            ws.add_cols(len(output[0]) - ws.col_count)
         ws.clear()
         ws.update(output, "A1", value_input_option="USER_ENTERED")
         print("  Sheet updated.")
