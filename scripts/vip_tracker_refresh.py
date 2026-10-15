@@ -26,6 +26,12 @@ Extra columns: a main-tab column that is neither a job column nor a Freya column
 carried forward by user_id under the same header, after all known columns. Formula
 cells keep their formula.
 
+Roster archive: a row that leaves the roster (LTV drops under $100, or the user turns
+internal) is copied to the "Roster archive" tab before the main tab is rewritten, so
+Freya's notes on it are kept. The job owns that tab and only appends to it.
+
+Creators: CREATOR_USER_IDS are left out of the Heat Report and get no voucher.
+
 Env vars required:
   GCP_SERVICE_ACCOUNT_JSON   full JSON of the GCP service account key
   SLACK_BOT_TOKEN            xoxb-... token with chat:write scope
@@ -54,6 +60,15 @@ SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 # Voucher = this share of spend_last_30_days, never below 0. No caps yet; add them in
 # calc_voucher_usd.
 VOUCHER_RATE = 0.10
+
+# Creator accounts (Niv, 2026-10-15). They get creator grants, so they are left out of
+# the Heat Report lists and counts, get a blank voucher_usd, and are excluded from any
+# Gifts log vs ledger check. Their rows stay on the main tab.
+CREATOR_USER_IDS = {
+    "01M1RWNG9HVNF6HR7XT6JBAPTA",
+}
+
+ARCHIVE_TAB = "Roster archive"
 
 # Gifts log tab, typed by hand by Freya. Read by header name, never written.
 GIFTS_TAB = "Gifts log"
@@ -317,13 +332,26 @@ def is_deleted(row):
     return str(row.get("first_name", "") or "").strip().upper() == "DELETED"
 
 
+def is_creator(row):
+    return str(row.get("user_id", "")).strip() in CREATOR_USER_IDS
+
+
+def excluded_from_report(row):
+    return is_deleted(row) or is_creator(row)
+
+
+def col_letter(n):
+    """1-based column number to its letter, e.g. 34 -> AH."""
+    return gspread.utils.rowcol_to_a1(1, n)[:-1]
+
+
 def days_since(d, today):
     return (today - d).days if d else None
 
 
 def build_report_lists(merged_rows, today):
     """Rows for the Heat Report, DELETED accounts excluded. Lists are uncapped."""
-    live = [r for r in merged_rows if not is_deleted(r)]
+    live = [r for r in merged_rows if not excluded_from_report(r)]
     by_ltv = lambda r: -float(r.get("ltv_usd") or 0)
 
     never = sorted([r for r in live if r["_contact_date"] is None], key=by_ltv)
@@ -438,13 +466,12 @@ def read_gifts_log(spreadsheet, today):
     return totals, rows_by_uid
 
 
-def read_extra_columns(ws):
+def read_extra_columns(ws, shown):
     """Columns on the main tab the job does not own, by header, keyed on user_id.
 
     Returns (extra_headers, values_by_uid). A formula cell keeps its formula; any
     other cell keeps its displayed value. Order follows the Sheet.
     """
-    shown = ws.get_all_values()
     if not shown:
         return [], {}
     formulas = ws.get_all_values(value_render_option="FORMULA")
@@ -552,7 +579,7 @@ def build_slack_message(merged_rows, today):
     lists = build_report_lists(merged_rows, today)
     live = lists["live"]
     counts = label_counts(live)
-    n_deleted = len(merged_rows) - len(live)
+    n_excluded = len(merged_rows) - len(live)
 
     def fmt_ltv(r):
         try:
@@ -588,7 +615,7 @@ def build_slack_message(merged_rows, today):
             f":snowflake: Cold: {counts['Cold']} | "
             f":black_square_button: Inactive: {counts['Inactive']}"
         ),
-        f"Total VIPs: {len(live)}" + (f" (excludes {n_deleted} deleted)" if n_deleted else ""),
+        f"Total VIPs: {len(live)}" + (f" (excludes {n_excluded} deleted or creator)" if n_excluded else ""),
         "",
         (
             f"*Needs attention ({lists['n_never_contacted']} never contacted, then last contact "
@@ -644,6 +671,42 @@ def build_slack_message(merged_rows, today):
     return "\n".join(lines)
 
 
+def archive_rows(spreadsheet, rows, today_str):
+    """Append rows that left the roster to the archive tab, matched by header.
+
+    rows are {header: shown value} dicts read from the main tab. New headers are
+    added to the end of the archive header; old archive rows are never changed.
+    """
+    try:
+        aws = spreadsheet.worksheet(ARCHIVE_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        aws = spreadsheet.add_worksheet(ARCHIVE_TAB, rows=100, cols=len(COLUMNS) + 1)
+
+    values = aws.get_all_values()
+    header = [h for h in (values[0] if values else []) if h.strip()]
+    wanted = list(rows[0].keys()) + ["archived_at"]
+    new_header = header + [h for h in wanted if h not in header]
+    if new_header != header:
+        if aws.col_count < len(new_header):
+            aws.add_cols(len(new_header) - aws.col_count)
+        aws.update([new_header], "A1", value_input_option="RAW")
+
+    # A run that failed after archiving would archive the same rows again; skip a
+    # user_id already archived today.
+    i_uid, i_at = new_header.index("user_id"), new_header.index("archived_at")
+    done_today = {
+        r[i_uid] for r in values[1:]
+        if len(r) > max(i_uid, i_at) and r[i_at] == today_str
+    }
+    out = [
+        [today_str if h == "archived_at" else row.get(h, "") for h in new_header]
+        for row in rows if row.get("user_id", "").strip() not in done_today
+    ]
+    if out:
+        aws.append_rows(out, value_input_option="RAW")
+    return len(out)
+
+
 def print_gift_sample(merged_rows, gift_rows, n=5):
     """Dry-run only: gift totals for a few user_ids with the log rows behind them."""
     sample = [r for r in merged_rows if r["user_id"] in gift_rows][:n]
@@ -686,9 +749,10 @@ def print_dry_run_summary(merged_rows, existing_by_uid, today):
         + ", ".join(r["user_id"] for r in lists["back_on_site"])
     )
     deleted_in_lists = [
-        r["user_id"] for r in lists["needs_attention"] + lists["back_on_site"] if is_deleted(r)
+        r["user_id"] for r in lists["needs_attention"] + lists["back_on_site"]
+        if excluded_from_report(r)
     ]
-    print(f"  DELETED rows in lists: {len(deleted_in_lists)}")
+    print(f"  DELETED or creator rows in lists: {len(deleted_in_lists)}")
 
 
 # --- Main ---
@@ -749,7 +813,8 @@ def main():
     # Nothing is written yet, so a failed read stops the run with the Sheet untouched.
     try:
         existing_data = ws.get_all_records(default_blank="")
-        extra_headers, extra_by_uid = read_extra_columns(ws)
+        shown = ws.get_all_values()
+        extra_headers, extra_by_uid = read_extra_columns(ws, shown)
         gift_totals, gift_rows = read_gifts_log(spreadsheet, today)
     except Exception as exc:
         msg = f"Sheet read failed, nothing written: {exc}"
@@ -780,7 +845,10 @@ def main():
         for col in AUTO_COLS:
             row[col] = safe_str(bq_row.get(col))
 
-        row["voucher_usd"] = safe_str(calc_voucher_usd(bq_row.get("spend_last_30_days")))
+        row["voucher_usd"] = (
+            "" if uid in CREATOR_USER_IDS
+            else safe_str(calc_voucher_usd(bq_row.get("spend_last_30_days")))
+        )
 
         if gift_totals is None:
             row["gifts_total_usd"] = row["gifts_last_30_days_usd"] = ""
@@ -841,7 +909,7 @@ def main():
 
     vouchers = [
         float(r["voucher_usd"]) for r in merged_rows
-        if r["voucher_usd"] != "" and not is_deleted(r)
+        if r["voucher_usd"] != "" and not excluded_from_report(r)
     ]
     paying = [v for v in vouchers if v > 0]
     print(
@@ -856,7 +924,23 @@ def main():
     # Sort ascending by hot_cold_score so coldest VIPs appear first in Sheet
     merged_rows.sort(key=lambda r: float(r.get("hot_cold_score") or 0))
 
+    # Rows on the main tab whose user_id left the roster, with every column as shown.
+    roster = {r["user_id"] for r in merged_rows}
+    sheet_header = shown[0] if shown else []
+    dropped = []
+    for vals in shown[1:]:
+        rec = {h: (vals[i] if i < len(vals) else "") for i, h in enumerate(sheet_header) if h.strip()}
+        if str(rec.get("user_id", "")).strip() and rec["user_id"].strip() not in roster:
+            dropped.append(rec)
+    if dropped:
+        print(f"  Left the roster, to archive: {', '.join(r['user_id'] for r in dropped)}")
+
     if dry_run:
+        width = len(COLUMNS) + len(extra_headers)
+        print(
+            f"  Grid {ws.row_count} rows x {ws.col_count} cols; output "
+            f"{len(merged_rows) + 1} x {width}, grid grows if needed"
+        )
         check_email_source(bq, merged_rows)
         print_dry_run_summary(merged_rows, existing_by_uid, today)
         print_gift_sample(merged_rows, gift_rows)
@@ -864,21 +948,50 @@ def main():
         return
 
     # --- 4. Write back to Sheet ---
+    # Archive first: if this fails, the main tab is untouched and the rows are still there.
+    if dropped:
+        try:
+            n = archive_rows(spreadsheet, dropped, today_str)
+            print(f"  Archived {n} rows to '{ARCHIVE_TAB}' ({len(dropped) - n} already archived today)")
+        except Exception as exc:
+            msg = f"Archive write failed, main tab not touched: {exc}"
+            print(msg, file=sys.stderr)
+            post_error(slack, msg)
+            sys.exit(1)
+
     print(f"Writing {len(merged_rows)} rows to Sheet...")
     # Extra columns go after every known column; a new VIP gets blanks in them.
     blank_extras = [""] * len(extra_headers)
     output = [COLUMNS + extra_headers] + [
         row_to_list(r) + extra_by_uid.get(r["user_id"], blank_extras) for r in merged_rows
     ]
+    height, width = len(output), len(output[0])
     try:
-        # ws.update() fails if the grid is narrower than the output.
-        if ws.col_count < len(output[0]):
-            ws.add_cols(len(output[0]) - ws.col_count)
-        ws.clear()
+        # Grow the grid first: ws.update() fails on a range past the sheet edge.
+        if ws.col_count < width:
+            ws.add_cols(width - ws.col_count)
+        if ws.row_count < height:
+            ws.add_rows(height - ws.row_count)
+        # Write over the old data, then clear only what is left beyond it. A failed
+        # write leaves the old data in place instead of an empty tab.
         ws.update(output, "A1", value_input_option="USER_ENTERED")
+    except Exception as exc:
+        msg = f"Sheet write failed, old data left in place: {exc}"
+        print(msg, file=sys.stderr)
+        post_error(slack, msg)
+        sys.exit(1)
+
+    leftovers = []
+    if ws.row_count > height:
+        leftovers.append(f"A{height + 1}:{col_letter(ws.col_count)}{ws.row_count}")
+    if ws.col_count > width:
+        leftovers.append(f"{col_letter(width + 1)}1:{col_letter(ws.col_count)}{height}")
+    try:
+        if leftovers:
+            ws.batch_clear(leftovers)
         print("  Sheet updated.")
     except Exception as exc:
-        msg = f"Sheet write failed (may be partially cleared - check Sheet): {exc}"
+        msg = f"Sheet written, but clearing old rows below it failed ({', '.join(leftovers)}): {exc}"
         print(msg, file=sys.stderr)
         post_error(slack, msg)
         sys.exit(1)
