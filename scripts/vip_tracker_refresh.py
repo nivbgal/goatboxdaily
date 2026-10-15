@@ -28,7 +28,9 @@ cells keep their formula.
 
 Roster archive: a row that leaves the roster (LTV drops under $100, or the user turns
 internal) is copied to the "Roster archive" tab before the main tab is rewritten, so
-Freya's notes on it are kept. The job owns that tab and only appends to it.
+Freya's notes on it are kept. The job owns that tab and only appends to it. When an
+archived user_id comes back onto the roster, its Sheet columns (Freya's, identity,
+tier history and extra columns) are restored from its latest archive row.
 
 Creators: CREATOR_USER_IDS are left out of the Heat Report and get no voucher.
 
@@ -707,6 +709,24 @@ def archive_rows(spreadsheet, rows, today_str):
     return len(out)
 
 
+def read_archive(spreadsheet):
+    """Latest archive row per user_id, as {header: value}. Empty if there is no tab."""
+    try:
+        values = spreadsheet.worksheet(ARCHIVE_TAB).get_all_values()
+    except gspread.exceptions.WorksheetNotFound:
+        return {}
+    if not values:
+        return {}
+    header = values[0]
+    latest = {}
+    for vals in values[1:]:  # appended in time order, so a later row wins
+        rec = {h: (vals[i] if i < len(vals) else "") for i, h in enumerate(header) if h.strip()}
+        uid = str(rec.get("user_id", "")).strip()
+        if uid:
+            latest[uid] = rec
+    return latest
+
+
 def print_gift_sample(merged_rows, gift_rows, n=5):
     """Dry-run only: gift totals for a few user_ids with the log rows behind them."""
     sample = [r for r in merged_rows if r["user_id"] in gift_rows][:n]
@@ -816,6 +836,7 @@ def main():
         shown = ws.get_all_values()
         extra_headers, extra_by_uid = read_extra_columns(ws, shown)
         gift_totals, gift_rows = read_gifts_log(spreadsheet, today)
+        archived_by_uid = read_archive(spreadsheet)
     except Exception as exc:
         msg = f"Sheet read failed, nothing written: {exc}"
         print(msg, file=sys.stderr)
@@ -834,11 +855,18 @@ def main():
     # --- 3. Merge BQ data with existing Sheet rows ---
     merged_rows = []
     bad_contact_dates = []
+    restored = []
 
     for bq_row in bq_rows:
         uid = str(bq_row.get("user_id", ""))
-        existing = existing_by_uid.get(uid, {})
-        is_new = uid not in existing_by_uid
+        existing = existing_by_uid.get(uid)
+        if existing is None and uid in archived_by_uid:
+            # Back on the roster after being archived: bring Freya's history back.
+            existing = archived_by_uid[uid]
+            restored.append(uid)
+            extra_by_uid[uid] = [existing.get(h, "") for h in extra_headers]
+        existing = existing or {}
+        is_new = not existing
 
         row = {}
 
@@ -884,6 +912,9 @@ def main():
 
         row.update(compute_scores(row, today))
         merged_rows.append(row)
+
+    if restored:
+        print(f"  Restored from '{ARCHIVE_TAB}': {', '.join(restored)}")
 
     if bad_contact_dates:
         print(
