@@ -688,7 +688,7 @@ lines += [
     f"• *Opened shop* · {shop_users:,} users {vs_avg(shop_users, 'shop_users')}",
     f"• *Started a purchase* · {intent_users:,} users · {usd(intent_usd)} of intent {vs_avg(intent_usd, 'intent_usd', money=True)}",
     f"       ↳ *Completed* · {usd(t('completed_usd'))} (*{pct(t('completed_usd'), intent_usd)}%* of intent)",
-    f"       ↳ *Abandoned after AML block* · {usd(aband_blocked_usd)} ({pct(aband_blocked_usd, intent_usd)}%)",
+    f"       ↳ *Cleared AML, then abandoned checkout* · {usd(aband_blocked_usd)} ({pct(aband_blocked_usd, intent_usd)}%)",
     f"       ↳ *Abandoned, no block* · {usd(aband_silent_usd)} (*{pct(aband_silent_usd, intent_usd)}%*) "
     f"across {plural(aband_silent_users, 'user')}",
     f"• *Blocked at AML wall* · {blocked_users:,} users · {usd(blocked_usd)} "
