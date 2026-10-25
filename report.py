@@ -53,6 +53,18 @@ def usd0(v):
 def pct(part, whole):
     return round(part / whole * 100) if whole else 0
 
+def pct_split(*parts):
+    """Whole-number shares of the total that add to exactly 100 (largest remainder)."""
+    total = sum(parts)
+    if not total:
+        return [0] * len(parts)
+    raw = [p / total * 100 for p in parts]
+    out = [int(r) for r in raw]
+    by_remainder = sorted(range(len(parts)), key=lambda i: raw[i] - out[i], reverse=True)
+    for i in by_remainder[:100 - sum(out)]:
+        out[i] += 1
+    return out
+
 def clean_slug(s):
     return (s or "unknown").replace("-shop-item", "").replace("-", " ").title()
 
@@ -182,11 +194,14 @@ try:
             )
           GROUP BY 1
         ),
-        -- Coins burned on box opens split into purchased vs free/promo currency.
+        -- Coins burned on box opens split into purchased, free/promo and withdrawable
+        -- currency. Withdrawable (incl. withdrawable_xp) arrived with the Oct 20 deploy (#735).
         coin_mix AS (
           SELECT DATE(event_timestamp) d,
                  ROUND(SUM(tx_coin_breakdown_transactional), 0) AS paid_coins,
-                 ROUND(SUM(tx_coin_breakdown_free), 0)          AS free_coins
+                 ROUND(SUM(tx_coin_breakdown_free), 0)          AS free_coins,
+                 ROUND(SUM(IFNULL(tx_coin_breakdown_withdrawable, 0)
+                           + IFNULL(tx_coin_breakdown_withdrawable_xp, 0)), 0) AS wd_coins
           FROM `{PROJECT}.flat_balance_events`
           WHERE DATE(event_timestamp) BETWEEN DATE_SUB(DATE 'DATE_FILTER', INTERVAL {TREND_DAYS - 1} DAY) AND DATE 'DATE_FILTER' AND {not_internal()}
             AND tx_action = 'paid_box_opening_debit' AND tx_asset = 'coin'
@@ -256,6 +271,7 @@ try:
           IFNULL(box_payers.coins, 0)      AS payer_box_coins,
           IFNULL(coin_mix.paid_coins, 0)   AS paid_coins,
           IFNULL(coin_mix.free_coins, 0)   AS free_coins,
+          IFNULL(coin_mix.wd_coins, 0)     AS wd_coins,
           SAFE_DIVIDE(IFNULL(box.opens, 0), NULLIF(dau_d.n, 0))            AS opens_per_dau,
           SAFE_DIVIDE(IFNULL(box_payers.opens, 0), NULLIF(pur.u, 0))       AS opens_per_payer,
           IFNULL(items.claimable_value, 0)  AS claimable_value,
@@ -482,7 +498,9 @@ payer_opens    = int(t("payer_box_opens"))
 payer_coins    = t("payer_box_coins")
 paid_coins     = t("paid_coins")
 free_coins     = t("free_coins")
-coins_burned   = paid_coins + free_coins
+wd_coins       = t("wd_coins")
+coins_burned   = paid_coins + free_coins + wd_coins
+coin_pcts      = pct_split(paid_coins, free_coins, wd_coins)
 opens_per_dau    = box_opens_n / dau if dau else 0
 opens_per_payer  = payer_opens / total_payers if total_payers else 0
 # Credits price 1:1 with USD (N credits = $N - 0.01), so 1 coin ~ $1 of sticker value.
@@ -767,7 +785,7 @@ lines += [
     f"• Avg box open · *{usd(avg_open_value)}* all users · *{usd(avg_open_value_payer)}* payers "
     f"_(coin value, 1 credit ≈ $1)_",
     f"• Revenue per open · *{usd(rev_per_open)}*  ·  coins burned *{coins_burned:,.0f}* "
-    f"({pct(paid_coins, coins_burned)}% purchased, {pct(free_coins, coins_burned)}% free/promo)",
+    f"({coin_pcts[0]}% purchased, {coin_pcts[1]}% free/promo, {coin_pcts[2]}% withdrawable)",
     f"• *GBR* · {usd0(box_coins)} coins in − {usd0(claimable_value)} claimable items out = "
     f"*{usd0(gbr)}* {vs_avg(gbr, 'gbr', money=True)}",
     f"    _excludes {usd0(noncla_value)} of vouchers/XP — non-claimable, cannot be shipped_",
