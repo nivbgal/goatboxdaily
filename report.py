@@ -440,6 +440,54 @@ try:
         LIMIT 10
     """)
 
+    # Payer retention, Quentin's definition (2026-10-23): users who registered in a
+    # Mon-Sun UTC week and have paid at any time up to the report date. Week 0 = active
+    # on days 1-6 after registering, week 1 = days 7-13, week 2 = days 14-20. wN_done
+    # marks registration weeks in which every registrant has finished that window.
+    retention_weeks = q(f"""
+        WITH reg AS (
+          SELECT user_id, DATE(MIN(event_timestamp)) AS rd
+          FROM `{PROJECT}.flat_registration_events`
+          WHERE {not_internal()}
+          GROUP BY 1
+          HAVING rd BETWEEN DATE_SUB(DATE 'DATE_FILTER', INTERVAL 70 DAY) AND DATE 'DATE_FILTER'
+        ),
+        payers AS (
+          SELECT DISTINCT user_id FROM `{PROJECT}.flat_purchase_events`
+          WHERE DATE(event_timestamp) <= DATE 'DATE_FILTER'
+        ),
+        act AS (
+          SELECT DISTINCT user_id, DATE(event_timestamp) AS d
+          FROM `goatbox-prod.source_data.events`
+          WHERE event_name IN ('login_completed', 'boxes_opened', 'shop_opened', 'assets_sold',
+                               'purchase_initiated', 'purchase_completed', 'payment_attempt_failed',
+                               'purchase_blocked_aml_required', 'purchase_blocked_aml_rejected',
+                               'aml_submitted', 'id_verification_completed', 'proof_of_address_completed',
+                               'email_verified', 'verification_email_resent', 'order_created',
+                               'basket_created', 'claim_shipping_paid', 'claim_shipping_abandoned',
+                               'claim_shipping_failed', 'offer_accepted', 'offer_dismissed',
+                               'promo_code_claimed')
+            AND DATE(event_timestamp) BETWEEN DATE_SUB(DATE 'DATE_FILTER', INTERVAL 70 DAY) AND DATE 'DATE_FILTER'
+        ),
+        u AS (
+          SELECT r.user_id, DATE_TRUNC(r.rd, WEEK(MONDAY)) AS wk,
+                 LOGICAL_OR(DATE_DIFF(a.d, r.rd, DAY) BETWEEN 1 AND 6)   AS q0,
+                 LOGICAL_OR(DATE_DIFF(a.d, r.rd, DAY) BETWEEN 7 AND 13)  AS q1,
+                 LOGICAL_OR(DATE_DIFF(a.d, r.rd, DAY) BETWEEN 14 AND 20) AS q2
+          FROM reg r
+          JOIN payers USING (user_id)
+          LEFT JOIN act a ON a.user_id = r.user_id
+          GROUP BY 1, 2
+        )
+        SELECT wk, COUNT(*) AS payers, COUNTIF(q0) AS w0, COUNTIF(q1) AS w1, COUNTIF(q2) AS w2,
+               DATE_ADD(wk, INTERVAL 6 + 6 DAY)  <= DATE 'DATE_FILTER' AS w0_done,
+               DATE_ADD(wk, INTERVAL 6 + 13 DAY) <= DATE 'DATE_FILTER' AS w1_done,
+               DATE_ADD(wk, INTERVAL 6 + 20 DAY) <= DATE 'DATE_FILTER' AS w2_done
+        FROM u
+        GROUP BY wk
+        ORDER BY wk DESC
+    """)
+
 except Exception as e:
     send_error(f"BigQuery query failed:\n```{e}```")
     raise
@@ -762,6 +810,30 @@ if total_payers:
         )
 else:
     lines.append("• No purchases recorded today")
+
+# Payer retention: for each window, the newest registration week that has fully
+# finished it, against the week before
+def retention_part(row, n):
+    payers, kept = int(row["payers"]), int(row[f"w{n}"])
+    rate = f"{kept / payers * 100:.1f}%" if payers else "n/a"
+    return rate, f"({kept} of {payers})"
+
+lines += ["", "*Payer Retention* (registered that week and ever paid)", ""]
+for n, days in ((0, "1-6"), (1, "7-13"), (2, "14-20")):
+    done = [r for r in retention_weeks if r[f"w{n}_done"]][:2]
+    if not done:
+        lines.append(f"• *Week {n}* (days {days}) · no finished registration week yet")
+        continue
+    wk = done[0]["wk"]
+    rate, count = retention_part(done[0], n)
+    line = (
+        f"• *Week {n}* (days {days}) · {'registered ' if n == 0 else ''}week of "
+        f"{wk:%b} {wk.day} · *{rate}* {count}"
+    )
+    if len(done) > 1:
+        prev_rate, prev_count = retention_part(done[1], n)
+        line += f", week before {prev_rate} {prev_count}"
+    lines.append(line)
 
 # Product mix — every product that sold
 lines += ["", "*Revenue by Store Product*", ""]
