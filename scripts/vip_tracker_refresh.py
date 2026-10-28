@@ -162,7 +162,19 @@ SELECT
   crm.lifecycle_state,
   crm.total_purchases,
   ROUND(CAST(crm.lifetime_purchases_usd AS FLOAT64) / NULLIF(crm.total_purchases, 0), 2) AS avg_transaction_usd,
-  crm.country,
+  -- user_fact_crm.country is the GA4 location of the registration session, so a US
+  -- user who signed up while traveling shows the wrong country (Italy for
+  -- 01M4E9AHQC4KC0V00CCV98CQC1, 2026-10-28). registration_country is the account's
+  -- own code; the old field is only a fallback when it is null.
+  COALESCE(
+    CASE crm.registration_country
+      WHEN 'US' THEN 'United States'
+      WHEN 'GB' THEN 'United Kingdom'
+      WHEN 'CA' THEN 'Canada'
+      ELSE crm.registration_country
+    END,
+    crm.country
+  ) AS country,
   crm.favorite_box_category,
   -- Purchases minus refunds over the last 30 days (rolling from now), the base for
   -- the 10%-of-30-day-spend voucher rule. Can go below 0 when a refund in the window
