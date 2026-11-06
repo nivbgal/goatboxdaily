@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import sys
 import datetime
 from collections import defaultdict
@@ -16,6 +17,7 @@ ERROR_USER_ID = "U0B0ZF5D6F9"
 
 PROJECT  = "goatbox-prod.processing_data"
 INTERNAL = f"`{PROJECT}.internal_users`"
+BRAND    = "goatbox"  # processing_data also holds HeroRips (brand = 'herorips') since 2026-10-22
 
 TREND_DAYS           = 7   # trailing window, inclusive of the report date
 MAX_RETURNING_DETAIL = 15  # returning payers broken out transaction-by-transaction
@@ -32,9 +34,19 @@ def not_internal(alias=""):
     return f"{col} NOT IN (SELECT user_id FROM {INTERNAL} WHERE user_id IS NOT NULL)"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+FLAT_TABLE = re.compile(r"`goatbox-prod\.processing_data\.flat_\w+`")
+
+def brand_only(sql):
+    """Scope every processing_data.flat_* table to BRAND. Each reference becomes a
+    filtered subquery, so existing aliases (`FROM ... b`) keep working.
+    source_data.events has no brand column; it is only joined on user_ids that already
+    came from a brand-filtered table, and user_ids never span brands."""
+    return FLAT_TABLE.sub(lambda m: f"(SELECT * FROM {m.group(0)} WHERE brand = '{BRAND}')", sql)
+
 def q(sql, params=None):
     job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
-    return [dict(row) for row in bq.query(sql.replace("DATE_FILTER", DATE), job_config=job_config).result()]
+    sql = brand_only(sql).replace("DATE_FILTER", DATE)
+    return [dict(row) for row in bq.query(sql, job_config=job_config).result()]
 
 def send_error(msg):
     try:
