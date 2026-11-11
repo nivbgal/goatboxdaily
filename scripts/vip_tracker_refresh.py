@@ -32,13 +32,19 @@ Freya's notes on it are kept. The job owns that tab and only appends to it.
 
 Creators: CREATOR_USER_IDS are left out of the Heat Report and get no voucher.
 
+Brands: user_fact_crm holds GOATbox and Hero Rips rows since 2026-11-10. Each brand has
+its own tab and its own tier config in BRANDS. GOATbox stays on the first tab; Hero Rips
+has a "Hero Rips" tab with the same columns plus goatbox_tier at the far right. A Hero
+Rips row found on the GOATbox tab moves to the Hero Rips tab with every Freya value. The
+Slack heat summary covers GOATbox only.
+
 Env vars required:
   GCP_SERVICE_ACCOUNT_JSON   full JSON of the GCP service account key
   SLACK_BOT_TOKEN            xoxb-... token with chat:write scope
 Optional:
   DRY_RUN=1                  query and merge, print counts, but don't write the Sheet or post
 
-Sheet: 1OE2X6Cbg3a0CGO2oRy_uZ28GFt1yFZQmHdjSRbeX-nk (Sheet1)
+Sheet: 1OE2X6Cbg3a0CGO2oRy_uZ28GFt1yFZQmHdjSRbeX-nk (first tab = GOATbox, "Hero Rips" tab)
 Slack: C0BAJM1T8LE (#vip)
 """
 
@@ -57,9 +63,38 @@ SHEET_ID = "1OE2X6Cbg3a0CGO2oRy_uZ28GFt1yFZQmHdjSRbeX-nk"
 SLACK_CHANNEL = "C0BAJM1T8LE"  # #vip
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 
-# Voucher = this share of spend_last_30_days, never below 0. No caps yet; add them in
-# calc_voucher_usd.
-VOUCHER_RATE = 0.10
+# Top Hero Rips tier. The name is not final (Niv, 2026-11-11): change it here only.
+HERORIPS_TOP_TIER = "Legend"
+
+# One config block per brand. Tiers run highest first as (name, min lifetime purchases
+# USD, recent purchase days). Tier is set by lifetime_purchases_usd (money paid in),
+# never by pack spend. When recent purchase days is set, the tier also needs a purchase
+# in that many days. A user who fits no tier is not on the roster.
+# voucher_rate: share of spend_last_30_days, never below 0, no caps yet (add them in
+# calc_voucher_usd). None leaves voucher_usd blank: no voucher rule is set for Hero Rips.
+BRANDS = {
+    "goatbox": {
+        "label": "GOATbox",
+        "tab": None,  # the first tab, read by index as before
+        "tiers": [
+            ("GOAT", 1000, None),
+            ("Gold", 250, None),
+            ("VIP", 100, None),
+        ],
+        "voucher_rate": 0.10,
+    },
+    "herorips": {
+        "label": "Hero Rips",
+        "tab": "Hero Rips",
+        "tiers": [
+            (HERORIPS_TOP_TIER, 5000, None),
+            ("Gold", 1000, None),
+            ("VIP", 250, None),
+            ("Insider", 100, 30),
+        ],
+        "voucher_rate": None,
+    },
+}
 
 # Creator accounts (Niv, 2026-10-15). They get creator grants, so they are left out of
 # the Heat Report lists and counts, get a blank voucher_usd, and are excluded from any
@@ -122,14 +157,47 @@ COLUMNS = [
     "gifts_total_usd", "gifts_last_30_days_usd",
 ]
 
-TIER_RANK = {"VIP": 1, "Gold": 2, "GOAT": 3}
+# Hero Rips tab only: the tier of the same person's GOATbox account, matched by email.
+GOATBOX_TIER_COL = "goatbox_tier"
 
+
+def brand_columns(brand):
+    return COLUMNS + [GOATBOX_TIER_COL] if brand == "herorips" else COLUMNS
+
+
+def tier_rank(brand):
+    tiers = BRANDS[brand]["tiers"]
+    return {name: len(tiers) - i for i, (name, _, _) in enumerate(tiers)}
+
+
+def tier_case_sql(brand):
+    """SQL CASE for the brand's tiers, from BRANDS. Names and numbers are our own constants."""
+    lines = []
+    for name, floor, recent_days in BRANDS[brand]["tiers"]:
+        cond = f"crm.lifetime_purchases_usd >= {floor}"
+        if recent_days:
+            cond += (
+                f" AND DATE(crm.last_purchase_at) >= "
+                f"DATE_SUB(CURRENT_DATE(), INTERVAL {recent_days} DAY)"
+            )
+        lines.append(f"    WHEN {cond} THEN '{name}'")
+    return "CASE\n" + "\n".join(lines) + "\n  END"
+
+
+def roster_sql(brand):
+    floor = min(f for _, f, _ in BRANDS[brand]["tiers"])
+    return BQ_SQL.replace("__TIER_CASE__", tier_case_sql(brand)).replace("__FLOOR__", str(floor))
+
+
+# @brand is 'goatbox' or 'herorips'. __TIER_CASE__ and __FLOOR__ come from BRANDS.
 BQ_SQL = """
 WITH crm_dedup AS (
-  -- user_fact_crm contains exact duplicate rows for ~82 user_ids; without this
-  -- those VIPs get two rows in the Sheet and are double-counted everywhere.
+  -- user_fact_crm holds both brands, and has duplicate rows for 107 user_ids (same
+  -- brand each time, checked 2026-11-11). Without the dedupe those VIPs get two rows
+  -- in the Sheet and are double-counted everywhere.
   SELECT *
   FROM `goatbox-prod.processing_data.user_fact_crm`
+  WHERE brand = @brand
   QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY last_purchase_at DESC) = 1
 ),
 vip_activity AS (
@@ -142,16 +210,13 @@ vip_activity AS (
     DATE(MAX(IF(event_name = 'purchase_completed', event_timestamp, NULL))) AS last_purchase_event_date
   FROM `goatbox-prod.source_data.events`
   WHERE event_name IN ('login_completed', 'boxes_opened', 'shop_opened', 'purchase_completed')
-    AND user_id IN (SELECT user_id FROM crm_dedup WHERE lifetime_purchases_usd >= 100)
+    AND user_id IN (SELECT user_id FROM crm_dedup WHERE lifetime_purchases_usd >= __FLOOR__)
   GROUP BY user_id
 )
+SELECT * FROM (
 SELECT
   crm.user_id,
-  CASE
-    WHEN crm.lifetime_purchases_usd >= 1000 THEN 'GOAT'
-    WHEN crm.lifetime_purchases_usd >= 250  THEN 'Gold'
-    WHEN crm.lifetime_purchases_usd >= 100  THEN 'VIP'
-  END AS tier,
+  __TIER_CASE__ AS tier,
   CAST(crm.lifetime_purchases_usd AS FLOAT64) AS ltv_usd,
   CAST(crm.lifetime_purchases_usd AS FLOAT64) - COALESCE(oc.total_procurement_cost, 0) AS net_spend_usd,
   DATE(crm.last_purchase_at) AS last_purchase_date,
@@ -211,12 +276,29 @@ LEFT JOIN (
   ) vp ON vp.order_id = o.order_id
   GROUP BY o.user_id
 ) oc ON oc.user_id = crm.user_id
-WHERE crm.lifetime_purchases_usd >= 100
+WHERE crm.lifetime_purchases_usd >= __FLOOR__
   AND NOT EXISTS (
     SELECT 1 FROM `goatbox-prod.processing_data.internal_users` iu
     WHERE iu.user_id = crm.user_id
   )
-ORDER BY crm.lifetime_purchases_usd DESC
+)
+-- A tier can need more than the floor (Hero Rips Insider needs a recent purchase).
+WHERE tier IS NOT NULL
+ORDER BY ltv_usd DESC
+"""
+
+# Hero Rips goatbox_tier match: the email on each user's latest purchase_completed.
+PURCHASE_EMAIL_SQL = """
+SELECT
+  e.user_id,
+  ARRAY_AGG(LOWER(TRIM(p.string_value)) ORDER BY e.event_timestamp DESC LIMIT 1)[OFFSET(0)] AS email
+FROM `goatbox-prod.source_data.events` e, UNNEST(e.event_params) p
+WHERE p.key = 'email'
+  AND p.string_value IS NOT NULL
+  AND TRIM(p.string_value) != ''
+  AND e.event_name = 'purchase_completed'
+  AND e.user_id IN UNNEST(@user_ids)
+GROUP BY e.user_id
 """
 
 # Purchase and balance events carry the account email as an event param. Checked
@@ -273,11 +355,11 @@ def calc_context_score(contact_date, last_purchase_date, last_active_date):
     return CONTEXT_NOTHING
 
 
-def calc_voucher_usd(spend_last_30_days):
-    # Blank spend stays blank; 0 or negative spend (refunds over purchases) gives 0.
-    if spend_last_30_days in (None, ""):
+def calc_voucher_usd(spend_last_30_days, rate):
+    # Blank spend or no rate stays blank; 0 or negative spend (refunds over purchases) gives 0.
+    if rate is None or spend_last_30_days in (None, ""):
         return ""
-    return round(max(0.0, float(spend_last_30_days)) * VOUCHER_RATE, 2)
+    return round(max(0.0, float(spend_last_30_days)) * rate, 2)
 
 
 def calc_hot_cold_label(score, contacted):
@@ -293,20 +375,22 @@ def calc_hot_cold_label(score, contacted):
     return "Inactive"
 
 
-def resolve_tier_change(new_tier, existing, is_new, today_str):
+def resolve_tier_change(new_tier, existing, is_new, today_str, rank, moved=False):
     """Compare the tier BQ reports now against the tier the Sheet recorded last run.
 
-    Returns (fields_to_write, move) where move is "up" / "down" / "new" / "". move is
-    only for today's Slack summary and is never written to the Sheet.
+    Returns (fields_to_write, move) where move is "up" / "down" / "new" / "moved" / "".
+    move is only for today's summary and is never written to the Sheet. A row moved in
+    from the other brand's tab starts its tier history fresh: its old tier was on the
+    other brand's scale, so comparing them would log a false move.
     """
     sheet_tier = str(existing.get("tier", "") or "").strip()
 
-    if is_new:
-        # First time on the roster: they arrived at this tier today.
-        return {"previous_tier": "", "tier_changed_at": today_str}, "new"
+    if is_new or moved:
+        # First time on this brand's roster: they arrived at this tier today.
+        return {"previous_tier": "", "tier_changed_at": today_str}, ("moved" if moved else "new")
 
     if sheet_tier and sheet_tier != new_tier:
-        move = "up" if TIER_RANK.get(new_tier, 0) > TIER_RANK.get(sheet_tier, 0) else "down"
+        move = "up" if rank.get(new_tier, 0) > rank.get(sheet_tier, 0) else "down"
         return {"previous_tier": sheet_tier, "tier_changed_at": today_str}, move
 
     # No change today: carry forward whatever the last move was.
@@ -398,8 +482,8 @@ def label_counts(rows):
     return counts
 
 
-def row_to_list(row_dict):
-    return [str(row_dict.get(col, "") if row_dict.get(col, "") is not None else "") for col in COLUMNS]
+def row_to_list(row_dict, columns=COLUMNS):
+    return [str(row_dict.get(col, "") if row_dict.get(col, "") is not None else "") for col in columns]
 
 
 def parse_gift_date(value):
@@ -478,8 +562,8 @@ def read_gifts_log(spreadsheet, today):
     return totals, rows_by_uid
 
 
-def read_extra_columns(ws, shown):
-    """Columns on the main tab the job does not own, by header, keyed on user_id.
+def read_extra_columns(ws, shown, known=COLUMNS):
+    """Columns on a roster tab the job does not own, by header, keyed on user_id.
 
     Returns (extra_headers, values_by_uid). A formula cell keeps its formula; any
     other cell keeps its displayed value. Order follows the Sheet.
@@ -492,7 +576,7 @@ def read_extra_columns(ws, shown):
         return [], {}
     i_uid = header.index("user_id")
 
-    extra_idx = [i for i, h in enumerate(header) if h.strip() and h.strip() not in COLUMNS]
+    extra_idx = [i for i, h in enumerate(header) if h.strip() and h.strip() not in known]
     unnamed = [
         gspread.utils.rowcol_to_a1(1, i + 1).rstrip("1")
         for i, h in enumerate(header)
@@ -575,6 +659,55 @@ def fill_blank_emails(bq, merged_rows):
         print(f"  Emails still blank for user_ids: {', '.join(still_blank)}")
 
 
+def norm_email(value):
+    return str(value or "").strip().lower()
+
+
+def fill_goatbox_tier(bq, hr_rows, gb_rows):
+    """Set goatbox_tier on each Hero Rips row. Mutates hr_rows. Returns the match count.
+
+    The Hero Rips side is the email on the user's latest purchase_completed event. The
+    GOATbox side is the email column of the GOATbox tab, so only GOATbox VIPs can match.
+    No match leaves the cell blank. Logs counts and user_ids only, never emails.
+    """
+    rank = tier_rank("goatbox")
+    gb_tier_by_email = {}
+    for r in gb_rows:
+        email = norm_email(r.get("email"))
+        if not email or is_deleted(r):
+            continue
+        best = gb_tier_by_email.get(email)
+        if best is None or rank.get(r["tier"], 0) > rank.get(best, 0):
+            gb_tier_by_email[email] = r["tier"]
+
+    for r in hr_rows:
+        r[GOATBOX_TIER_COL] = ""
+    if not hr_rows:
+        return 0
+
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ArrayQueryParameter("user_ids", "STRING", [r["user_id"] for r in hr_rows]),
+    ])
+    hr_email = {
+        row["user_id"]: norm_email(row["email"])
+        for row in bq.query(PURCHASE_EMAIL_SQL, job_config=job_config).result()
+    }
+
+    matched = []
+    for r in hr_rows:
+        tier = gb_tier_by_email.get(hr_email.get(r["user_id"], ""))
+        if tier:
+            r[GOATBOX_TIER_COL] = tier
+            matched.append(r["user_id"])
+    no_email = sum(1 for r in hr_rows if r["user_id"] not in hr_email)
+    print(
+        f"  goatbox_tier: {len(matched)} of {len(hr_rows)} Hero Rips rows matched a GOATbox VIP"
+        f" ({no_email} with no purchase_completed email)"
+        + (f": {', '.join(matched)}" if matched else "")
+    )
+    return len(matched)
+
+
 def post_error(slack, msg):
     try:
         slack.chat_postMessage(
@@ -642,10 +775,11 @@ def build_slack_message(merged_rows, today):
         *capped(lists["back_on_site"], fmt_back),
     ]
 
-    # Tier moves detected this run, biggest new tier first
+    # Tier moves detected this run, biggest new tier first. The summary is GOATbox only.
+    rank = tier_rank("goatbox")
     tier_moves = sorted(
         [r for r in live if r.get("_tier_move") in ("up", "down")],
-        key=lambda r: (TIER_RANK.get(r.get("tier", ""), 0), float(r.get("ltv_usd") or 0)),
+        key=lambda r: (rank.get(r.get("tier", ""), 0), float(r.get("ltv_usd") or 0)),
         reverse=True,
     )
 
@@ -692,7 +826,7 @@ def archive_rows(spreadsheet, rows, today_str):
     try:
         aws = spreadsheet.worksheet(ARCHIVE_TAB)
     except gspread.exceptions.WorksheetNotFound:
-        aws = spreadsheet.add_worksheet(ARCHIVE_TAB, rows=100, cols=len(COLUMNS) + 1)
+        aws = spreadsheet.add_worksheet(ARCHIVE_TAB, rows=100, cols=len(COLUMNS) + 2)
 
     values = aws.get_all_values()
     header = [h for h in (values[0] if values else []) if h.strip()]
@@ -769,83 +903,41 @@ def print_dry_run_summary(merged_rows, existing_by_uid, today):
 
 # --- Main ---
 
-def main():
-    sa_json_str = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
-    slack_token = os.environ.get("SLACK_BOT_TOKEN")
-    today = date.today()
-    today_str = today.isoformat()
-    dry_run = os.environ.get("DRY_RUN") == "1"
+def read_tab(spreadsheet, brand):
+    """Read one brand's roster tab. Returns a dict; a missing Hero Rips tab reads as empty.
 
-    if not sa_json_str or not slack_token:
-        print("ERROR: GCP_SERVICE_ACCOUNT_JSON and SLACK_BOT_TOKEN must be set", file=sys.stderr)
-        sys.exit(1)
+    Nothing is created here, so a failed run leaves the Sheet as it was.
+    """
+    cfg = BRANDS[brand]
+    if cfg["tab"] is None:
+        ws = spreadsheet.get_worksheet(0)
+    else:
+        try:
+            ws = spreadsheet.worksheet(cfg["tab"])
+        except gspread.exceptions.WorksheetNotFound:
+            ws = None
+    if ws is None:
+        return {"ws": None, "existing": {}, "shown": [], "extra_headers": [], "extra_by_uid": {}}
 
-    slack = WebClient(token=slack_token)
-    sa_info = json.loads(sa_json_str)
-
-    # --- 1. Query BigQuery [Certain: if this fails we abort before touching the Sheet] ---
-    print("Querying BigQuery for full VIP roster...")
-    bq_creds = service_account.Credentials.from_service_account_info(
-        sa_info,
-        scopes=["https://www.googleapis.com/auth/cloud-platform"],
-    )
-    bq = bigquery.Client(credentials=bq_creds, project=sa_info["project_id"])
-
-    try:
-        bq_rows = [dict(r) for r in bq.query(BQ_SQL).result()]
-    except Exception as exc:
-        msg = str(exc)
-        print(f"BigQuery error: {msg}", file=sys.stderr)
-        post_error(slack, msg)
-        sys.exit(1)
-
-    print(f"  BQ returned {len(bq_rows)} VIP rows")
-
-    # Guard: a 0-row result almost certainly means a query/data problem, not a real empty VIP list.
-    # Clearing the sheet on 0 rows would wipe all of Freya's notes.
-    if not bq_rows:
-        msg = "BQ returned 0 VIP rows - refusing to overwrite Sheet data"
-        print(msg, file=sys.stderr)
-        post_error(slack, msg)
-        sys.exit(1)
-
-    # --- 2. Read existing Sheet to preserve Freya columns ---
-    print("Reading existing Google Sheet...")
-    sheets_creds = service_account.Credentials.from_service_account_info(
-        sa_info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-    gc = gspread.authorize(sheets_creds)
-    spreadsheet = gc.open_by_key(SHEET_ID)
-    ws = spreadsheet.get_worksheet(0)
-
-    # Nothing is written yet, so a failed read stops the run with the Sheet untouched.
-    try:
-        existing_data = ws.get_all_records(default_blank="")
-        shown = ws.get_all_values()
-        extra_headers, extra_by_uid = read_extra_columns(ws, shown)
-        gift_totals, gift_rows = read_gifts_log(spreadsheet, today)
-    except Exception as exc:
-        msg = f"Sheet read failed, nothing written: {exc}"
-        print(msg, file=sys.stderr)
-        post_error(slack, msg)
-        sys.exit(1)
-
-    existing_by_uid = {
-        str(r.get("user_id", "")): r
-        for r in existing_data
-        if r.get("user_id")
+    existing_data = ws.get_all_records(default_blank="")
+    shown = ws.get_all_values()
+    extra_headers, extra_by_uid = read_extra_columns(ws, shown, brand_columns(brand))
+    existing = {str(r.get("user_id", "")): r for r in existing_data if r.get("user_id")}
+    return {
+        "ws": ws, "existing": existing, "shown": shown,
+        "extra_headers": extra_headers, "extra_by_uid": extra_by_uid,
     }
-    print(f"  Sheet has {len(existing_by_uid)} existing rows")
-    if extra_headers:
-        print(f"  Keeping {len(extra_headers)} extra columns: {', '.join(extra_headers)}")
 
-    # --- 3. Merge BQ data with existing Sheet rows ---
-    merged_rows = []
-    bad_contact_dates = []
+
+def merge_rows(brand, bq_rows, existing_by_uid, moved_in, gift_totals, today):
+    """Merge one brand's BigQuery rows with its Sheet rows. Returns (rows, bad_contact_uids).
+
+    moved_in is the set of user_ids whose Sheet values came from the other brand's tab.
+    """
+    cfg = BRANDS[brand]
+    rank = tier_rank(brand)
+    today_str = today.isoformat()
+    merged_rows, bad_contact_dates = [], []
 
     for bq_row in bq_rows:
         uid = str(bq_row.get("user_id", ""))
@@ -859,7 +951,7 @@ def main():
 
         row["voucher_usd"] = (
             "" if uid in CREATOR_USER_IDS
-            else safe_str(calc_voucher_usd(bq_row.get("spend_last_30_days")))
+            else safe_str(calc_voucher_usd(bq_row.get("spend_last_30_days"), cfg["voucher_rate"]))
         )
 
         if gift_totals is None:
@@ -877,13 +969,16 @@ def main():
                 row[col] = row[col].strip()
 
         # Freya cols: NEVER overwrite. New VIPs get relationship_stage="new", rest blank.
+        # A row moved from the other tab is not new: it keeps every Freya value.
         for col in FREYA_COLS:
             if is_new and col == "relationship_stage":
                 row[col] = "new"
             else:
                 row[col] = str(existing.get(col, "") or "")
 
-        tier_fields, move = resolve_tier_change(row["tier"], existing, is_new, today_str)
+        tier_fields, move = resolve_tier_change(
+            row["tier"], existing, is_new, today_str, rank, moved=uid in moved_in,
+        )
         row.update(tier_fields)
         row["_tier_move"] = move  # transient, not in COLUMNS so never written to the Sheet
 
@@ -897,101 +992,36 @@ def main():
         row.update(compute_scores(row, today))
         merged_rows.append(row)
 
-    if bad_contact_dates:
-        print(
-            f"  WARNING: last_contacted_at not MM/DD/YYYY for {len(bad_contact_dates)} rows, "
-            f"scored as never contacted: {', '.join(bad_contact_dates)}",
-            file=sys.stderr,
-        )
-
-    if gift_totals:
-        roster = {r["user_id"] for r in merged_rows}
-        off_roster = sorted(u for u in gift_totals if u not in roster)
-        if off_roster:
-            print(
-                f"  WARNING: Gifts log user_ids not on the main tab, skipped: {', '.join(off_roster)}",
-                file=sys.stderr,
-            )
-
-    # A failed lookup leaves emails blank for a retry next run; it must not block the refresh.
-    try:
-        fill_blank_emails(bq, merged_rows)
-    except Exception as exc:
-        print(f"  WARNING: email fill skipped: {exc}", file=sys.stderr)
-
-    vouchers = [
-        float(r["voucher_usd"]) for r in merged_rows
-        if r["voucher_usd"] != "" and not excluded_from_report(r)
-    ]
-    paying = [v for v in vouchers if v > 0]
-    print(
-        f"  Vouchers: {len(paying)} rows above 0, "
-        f"total ${sum(paying):,.2f}, max ${max(paying, default=0):,.2f}"
-    )
-
-    n_up = sum(1 for r in merged_rows if r["_tier_move"] == "up")
-    n_down = sum(1 for r in merged_rows if r["_tier_move"] == "down")
-    print(f"  Tier moves since last run: {n_up} up, {n_down} down")
-
     # Sort ascending by hot_cold_score so coldest VIPs appear first in Sheet
     merged_rows.sort(key=lambda r: float(r.get("hot_cold_score") or 0))
+    return merged_rows, bad_contact_dates
 
-    # Rows on the main tab whose user_id left the roster, with every column as shown.
-    roster = {r["user_id"] for r in merged_rows}
-    sheet_header = shown[0] if shown else []
-    dropped = []
+
+def rows_leaving(tab, keep_uids):
+    """Rows on a tab whose user_id is not in keep_uids, with every column as shown."""
+    shown = tab["shown"]
+    header = shown[0] if shown else []
+    out = []
     for vals in shown[1:]:
-        rec = {h: (vals[i] if i < len(vals) else "") for i, h in enumerate(sheet_header) if h.strip()}
-        if str(rec.get("user_id", "")).strip() and rec["user_id"].strip() not in roster:
-            dropped.append(rec)
-    if dropped:
-        print(f"  Left the roster, to archive: {', '.join(r['user_id'] for r in dropped)}")
+        rec = {h: (vals[i] if i < len(vals) else "") for i, h in enumerate(header) if h.strip()}
+        if str(rec.get("user_id", "")).strip() and rec["user_id"].strip() not in keep_uids:
+            out.append(rec)
+    return out
 
-    if dry_run:
-        width = len(COLUMNS) + len(extra_headers)
-        print(
-            f"  Grid {ws.row_count} rows x {ws.col_count} cols; output "
-            f"{len(merged_rows) + 1} x {width}, grid grows if needed"
-        )
-        check_email_source(bq, merged_rows)
-        print_dry_run_summary(merged_rows, existing_by_uid, today)
-        print_gift_sample(merged_rows, gift_rows)
-        print(f"DRY RUN: would write {len(merged_rows)} rows; Sheet and Slack left untouched.")
-        return
 
-    # --- 4. Write back to Sheet ---
-    # Archive first: if this fails, the main tab is untouched and the rows are still there.
-    if dropped:
-        try:
-            n = archive_rows(spreadsheet, dropped, today_str)
-            print(f"  Archived {n} rows to '{ARCHIVE_TAB}' ({len(dropped) - n} already archived today)")
-        except Exception as exc:
-            msg = f"Archive write failed, main tab not touched: {exc}"
-            print(msg, file=sys.stderr)
-            post_error(slack, msg)
-            sys.exit(1)
+def write_tab(ws, output):
+    """Write output over a tab, then clear only what is left beyond it.
 
-    print(f"Writing {len(merged_rows)} rows to Sheet...")
-    # Extra columns go after every known column; a new VIP gets blanks in them.
-    blank_extras = [""] * len(extra_headers)
-    output = [COLUMNS + extra_headers] + [
-        row_to_list(r) + extra_by_uid.get(r["user_id"], blank_extras) for r in merged_rows
-    ]
+    Raises on a failed write; a failed write leaves the old data in place instead of an
+    empty tab. Returns the ranges it could not clear, as an error string, or "".
+    """
     height, width = len(output), len(output[0])
-    try:
-        # Grow the grid first: ws.update() fails on a range past the sheet edge.
-        if ws.col_count < width:
-            ws.add_cols(width - ws.col_count)
-        if ws.row_count < height:
-            ws.add_rows(height - ws.row_count)
-        # Write over the old data, then clear only what is left beyond it. A failed
-        # write leaves the old data in place instead of an empty tab.
-        ws.update(output, "A1", value_input_option="USER_ENTERED")
-    except Exception as exc:
-        msg = f"Sheet write failed, old data left in place: {exc}"
-        print(msg, file=sys.stderr)
-        post_error(slack, msg)
-        sys.exit(1)
+    # Grow the grid first: ws.update() fails on a range past the sheet edge.
+    if ws.col_count < width:
+        ws.add_cols(width - ws.col_count)
+    if ws.row_count < height:
+        ws.add_rows(height - ws.row_count)
+    ws.update(output, "A1", value_input_option="USER_ENTERED")
 
     leftovers = []
     if ws.row_count > height:
@@ -1001,16 +1031,275 @@ def main():
     try:
         if leftovers:
             ws.batch_clear(leftovers)
-        print("  Sheet updated.")
     except Exception as exc:
-        msg = f"Sheet written, but clearing old rows below it failed ({', '.join(leftovers)}): {exc}"
+        return f"clearing old rows below it failed ({', '.join(leftovers)}): {exc}"
+    return ""
+
+
+def tab_output(brand, rows, tab):
+    # Extra columns go after every known column; a new VIP gets blanks in them.
+    blank_extras = [""] * len(tab["extra_headers"])
+    cols = brand_columns(brand)
+    return [cols + tab["extra_headers"]] + [
+        row_to_list(r, cols) + tab["extra_by_uid"].get(r["user_id"], blank_extras) for r in rows
+    ]
+
+
+def tier_counts(rows, brand):
+    counts = {name: 0 for name, _, _ in BRANDS[brand]["tiers"]}
+    for r in rows:
+        counts[r["tier"]] = counts.get(r["tier"], 0) + 1
+    return counts
+
+
+def print_brand_dry_run(brand, rows, tab):
+    label = BRANDS[brand]["label"]
+    out = tab_output(brand, rows, tab)
+    print(f"  [{label}] {len(rows)} rows, tiers {tier_counts(rows, brand)}")
+    print(f"  [{label}] output {len(out)} x {len(out[0])}, header ends ...{', '.join(out[0][-3:])}")
+
+
+def main():
+    sa_json_str = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    slack_token = os.environ.get("SLACK_BOT_TOKEN")
+    today = date.today()
+    today_str = today.isoformat()
+    dry_run = os.environ.get("DRY_RUN") == "1"
+
+    if not sa_json_str or not slack_token:
+        print("ERROR: GCP_SERVICE_ACCOUNT_JSON and SLACK_BOT_TOKEN must be set", file=sys.stderr)
+        sys.exit(1)
+
+    slack = WebClient(token=slack_token)
+    sa_info = json.loads(sa_json_str)
+
+    # --- 1. Query BigQuery [Certain: if this fails we abort before touching the Sheet] ---
+    bq_creds = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    bq = bigquery.Client(credentials=bq_creds, project=sa_info["project_id"])
+
+    bq_rows = {}
+    for brand in BRANDS:
+        print(f"Querying BigQuery for the {BRANDS[brand]['label']} VIP roster...")
+        job_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("brand", "STRING", brand),
+        ])
+        try:
+            bq_rows[brand] = [dict(r) for r in bq.query(roster_sql(brand), job_config=job_config).result()]
+        except Exception as exc:
+            msg = str(exc)
+            print(f"BigQuery error: {msg}", file=sys.stderr)
+            post_error(slack, msg)
+            sys.exit(1)
+        print(f"  BQ returned {len(bq_rows[brand])} rows")
+
+    # Guard: a 0-row result almost certainly means a query/data problem, not a real empty VIP list.
+    # Clearing the sheet on 0 rows would wipe all of Freya's notes.
+    for brand, rows in bq_rows.items():
+        if not rows:
+            msg = f"BQ returned 0 {BRANDS[brand]['label']} VIP rows - refusing to overwrite Sheet data"
+            print(msg, file=sys.stderr)
+            post_error(slack, msg)
+            sys.exit(1)
+
+    # --- 2. Read existing Sheet to preserve Freya columns ---
+    print("Reading existing Google Sheet...")
+    sheets_creds = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    gc = gspread.authorize(sheets_creds)
+    spreadsheet = gc.open_by_key(SHEET_ID)
+
+    # Nothing is written yet, so a failed read stops the run with the Sheet untouched.
+    try:
+        tabs = {brand: read_tab(spreadsheet, brand) for brand in BRANDS}
+        gift_totals, gift_rows = read_gifts_log(spreadsheet, today)
+    except Exception as exc:
+        msg = f"Sheet read failed, nothing written: {exc}"
         print(msg, file=sys.stderr)
         post_error(slack, msg)
         sys.exit(1)
 
-    # --- 5. Post heat summary to Slack #vip ---
+    gb_tab, hr_tab = tabs["goatbox"], tabs["herorips"]
+    for brand, tab in tabs.items():
+        where = "no tab yet" if tab["ws"] is None else f"{len(tab['existing'])} existing rows"
+        print(f"  [{BRANDS[brand]['label']}] {where}")
+        if tab["extra_headers"]:
+            print(f"  [{BRANDS[brand]['label']}] keeping {len(tab['extra_headers'])} extra columns: "
+                  f"{', '.join(tab['extra_headers'])}")
+
+    # --- 3. Move Hero Rips rows off the GOATbox tab ---
+    # A Hero Rips user on the GOATbox tab takes its Sheet values (Freya's columns, names,
+    # email) to the Hero Rips tab. The Hero Rips tab wins if the user is on both.
+    hr_roster = {str(r["user_id"]) for r in bq_rows["herorips"]}
+    moved_in = {
+        uid for uid in gb_tab["existing"]
+        if uid in hr_roster and uid not in hr_tab["existing"]
+    }
+    # Extra columns on the GOATbox tab have no place on the Hero Rips tab yet. Stop
+    # rather than drop a note.
+    stuck = [
+        uid for uid in moved_in
+        if any(str(v).strip() for v in gb_tab["extra_by_uid"].get(uid, []))
+    ]
+    if stuck:
+        msg = (
+            "Hero Rips rows to move have values in extra GOATbox columns "
+            f"({', '.join(gb_tab['extra_headers'])}), nothing written: {', '.join(sorted(stuck))}"
+        )
+        print(msg, file=sys.stderr)
+        post_error(slack, msg)
+        sys.exit(1)
+    hr_existing = dict(hr_tab["existing"])
+    for uid in moved_in:
+        hr_existing[uid] = gb_tab["existing"][uid]
+    if moved_in:
+        print(f"  Moving {len(moved_in)} Hero Rips rows to '{BRANDS['herorips']['tab']}': "
+              f"{', '.join(sorted(moved_in))}")
+
+    # --- 4. Merge BQ data with existing Sheet rows ---
+    merged = {}
+    merged["goatbox"], bad_gb = merge_rows(
+        "goatbox", bq_rows["goatbox"], gb_tab["existing"], set(), gift_totals, today,
+    )
+    merged["herorips"], bad_hr = merge_rows(
+        "herorips", bq_rows["herorips"], hr_existing, moved_in, gift_totals, today,
+    )
+    bad_contact_dates = bad_gb + bad_hr
+    if bad_contact_dates:
+        print(
+            f"  WARNING: last_contacted_at not MM/DD/YYYY for {len(bad_contact_dates)} rows, "
+            f"scored as never contacted: {', '.join(bad_contact_dates)}",
+            file=sys.stderr,
+        )
+
+    all_rows = merged["goatbox"] + merged["herorips"]
+    if gift_totals:
+        roster = {r["user_id"] for r in all_rows}
+        off_roster = sorted(u for u in gift_totals if u not in roster)
+        if off_roster:
+            print(
+                f"  WARNING: Gifts log user_ids on neither roster tab, skipped: {', '.join(off_roster)}",
+                file=sys.stderr,
+            )
+
+    # A failed lookup leaves emails blank for a retry next run; it must not block the refresh.
+    try:
+        fill_blank_emails(bq, all_rows)
+    except Exception as exc:
+        print(f"  WARNING: email fill skipped: {exc}", file=sys.stderr)
+
+    # A failed match leaves goatbox_tier blank; it must not block the refresh.
+    try:
+        fill_goatbox_tier(bq, merged["herorips"], merged["goatbox"])
+    except Exception as exc:
+        for r in merged["herorips"]:
+            r[GOATBOX_TIER_COL] = ""
+        print(f"  WARNING: goatbox_tier match skipped: {exc}", file=sys.stderr)
+
+    vouchers = [
+        float(r["voucher_usd"]) for r in merged["goatbox"]
+        if r["voucher_usd"] != "" and not excluded_from_report(r)
+    ]
+    paying = [v for v in vouchers if v > 0]
+    print(
+        f"  Vouchers (GOATbox): {len(paying)} rows above 0, "
+        f"total ${sum(paying):,.2f}, max ${max(paying, default=0):,.2f}"
+    )
+
+    for brand, rows in merged.items():
+        n_up = sum(1 for r in rows if r["_tier_move"] == "up")
+        n_down = sum(1 for r in rows if r["_tier_move"] == "down")
+        print(f"  [{BRANDS[brand]['label']}] tier moves since last run: {n_up} up, {n_down} down")
+
+    # Rows that left a roster go to the archive. A Hero Rips row leaving the GOATbox tab
+    # is moving tabs, not leaving, so it is not archived.
+    gb_keep = {r["user_id"] for r in merged["goatbox"]} | hr_roster
+    hr_keep = {r["user_id"] for r in merged["herorips"]}
+    dropped = rows_leaving(gb_tab, gb_keep) + rows_leaving(hr_tab, hr_keep)
+    if dropped:
+        print(f"  Left the roster, to archive: {', '.join(r['user_id'] for r in dropped)}")
+
+    if dry_run:
+        for brand in BRANDS:
+            print_brand_dry_run(brand, merged[brand], tabs[brand])
+        gb_before = set(gb_tab["existing"])
+        gb_after = {r["user_id"] for r in merged["goatbox"]}
+        print(f"  [GOATbox] leaving the tab: {', '.join(sorted(gb_before - gb_after)) or 'none'}")
+        print(f"  [GOATbox] new on the tab: {', '.join(sorted(gb_after - gb_before)) or 'none'}")
+        for r in sorted(merged["herorips"], key=lambda r: -float(r["ltv_usd"] or 0)):
+            src = "moved from GOATbox tab" if r["user_id"] in moved_in else (
+                "already on tab" if r["user_id"] in hr_tab["existing"] else "new")
+            print(
+                f"  [Hero Rips] {r['user_id']} | {r['tier']} | ${float(r['ltv_usd']):,.2f} | "
+                f"goatbox_tier '{r[GOATBOX_TIER_COL]}' | {src}"
+            )
+        # Freya and identity values on moved rows, checked against the GOATbox tab. Counts only.
+        check_cols = FREYA_COLS + IDENTITY_COLS
+        def sheet_value(uid, col):
+            # merge_rows trims names, so compare names trimmed too.
+            v = str(gb_tab["existing"][uid].get(col, "") or "")
+            return v.strip() if col in ("first_name", "last_name") else v
+
+        same = [
+            r["user_id"] for r in merged["herorips"]
+            if r["user_id"] in moved_in
+            and all(str(r[c]) == sheet_value(r["user_id"], c) for c in check_cols)
+        ]
+        print(f"  Moved rows with all {len(check_cols)} Freya and identity values unchanged: "
+              f"{len(same)} of {len(moved_in)}")
+        check_email_source(bq, merged["goatbox"])
+        print_dry_run_summary(merged["goatbox"], gb_tab["existing"], today)
+        print_gift_sample(merged["goatbox"], gift_rows)
+        print("DRY RUN: Sheet and Slack left untouched.")
+        return
+
+    # --- 5. Write back to Sheet ---
+    # Archive first: if this fails, the roster tabs are untouched and the rows are still there.
+    if dropped:
+        try:
+            n = archive_rows(spreadsheet, dropped, today_str)
+            print(f"  Archived {n} rows to '{ARCHIVE_TAB}' ({len(dropped) - n} already archived today)")
+        except Exception as exc:
+            msg = f"Archive write failed, roster tabs not touched: {exc}"
+            print(msg, file=sys.stderr)
+            post_error(slack, msg)
+            sys.exit(1)
+
+    # Hero Rips tab before GOATbox tab: if it fails, the moved rows are still on the
+    # GOATbox tab with Freya's values.
+    for brand in ("herorips", "goatbox"):
+        label = BRANDS[brand]["label"]
+        output = tab_output(brand, merged[brand], tabs[brand])
+        print(f"Writing {len(merged[brand])} rows to the {label} tab...")
+        try:
+            ws = tabs[brand]["ws"]
+            if ws is None:
+                ws = spreadsheet.add_worksheet(
+                    BRANDS[brand]["tab"], rows=len(output) + 10, cols=len(output[0]),
+                )
+            clear_err = write_tab(ws, output)
+        except Exception as exc:
+            msg = f"{label} tab write failed, old data left in place: {exc}"
+            print(msg, file=sys.stderr)
+            post_error(slack, msg)
+            sys.exit(1)
+        if clear_err:
+            msg = f"{label} tab written, but {clear_err}"
+            print(msg, file=sys.stderr)
+            post_error(slack, msg)
+            sys.exit(1)
+        print(f"  {label} tab updated.")
+
+    # --- 6. Post heat summary to Slack #vip (GOATbox only) ---
     print("Posting heat summary to #vip...")
-    msg = build_slack_message(merged_rows, today)
+    msg = build_slack_message(merged["goatbox"], today)
 
     try:
         resp = slack.chat_postMessage(
