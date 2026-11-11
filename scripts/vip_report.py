@@ -1,7 +1,11 @@
 """
 vip_report.py
-Checks for GOATbox VIP tier crossings in the last 24h and posts to #vip. Hero Rips
-players are left out; they have their own tab in the VIP tracker.
+Checks for VIP tier crossings in the last 24h and posts to #vip, one post per brand.
+GOATbox posts every day, "no new VIPs" included. Hero Rips posts only when someone
+crossed a tier. Tiers come from BRANDS in vip_tracker_refresh.py, the same config the
+tracker uses. A crossing is a user whose tier after the last purchase ranks above the
+tier before it, with the Hero Rips Insider 30-day rule applied to both (see
+crossing_sql).
 
 Splits crossings into two groups:
   - new entrants  — had no tier before this purchase (crossed $100 for the first time)
@@ -20,19 +24,104 @@ from google.cloud import bigquery
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+from vip_tracker_refresh import BRANDS, HERORIPS_TOP_TIER
+
 SLACK_VIP_CHANNEL = "C0BAJM1T8LE"   # #vip
 ERROR_USER_ID     = "U0B0ZF5D6F9"   # niv — receives error DMs
 MAX_BLOCKS        = 50              # Slack hard limit per message
 
+# Per brand: header titles and tier emoji. GOATbox keeps the titles it always had.
+POST = {
+    "goatbox": {
+        "new_title": "🆕 New VIP Entrants",
+        "up_title": "⬆️ Tier Upgrades",
+        "emoji": {"GOAT": "🐐", "Gold": "🥇", "VIP": "⭐"},
+        "post_when_empty": True,
+    },
+    "herorips": {
+        "new_title": "🆕 New Hero Rips VIP Entrants",
+        "up_title": "⬆️ Hero Rips Tier Upgrades",
+        "emoji": {HERORIPS_TOP_TIER: "👑", "Gold": "🥇", "VIP": "⭐", "Insider": "🔹"},
+        "post_when_empty": False,
+    },
+}
+
+
+def tier_sql(brand, ltv, purchase_at, as_of):
+    """SQL CASE giving a brand's tier from lifetime purchases ltv, using the tracker
+    config. A tier with a recent-purchase rule also needs purchase_at to be no more than
+    that many days before as_of. Names and numbers are our own constants."""
+    lines = []
+    for name, floor, recent_days in BRANDS[brand]["tiers"]:
+        cond = f"{ltv} >= {floor}"
+        if recent_days:
+            cond += (
+                f" AND {purchase_at} IS NOT NULL"
+                f" AND {purchase_at} >= TIMESTAMP_SUB({as_of}, INTERVAL {recent_days} DAY)"
+            )
+        lines.append(f"    WHEN {cond} THEN '{name}'")
+    return "CASE\n" + "\n".join(lines) + "\n  END"
+
+
+def rank_sql(brand, col):
+    """SQL CASE turning a tier name into its rank (higher is better), NULL for no tier."""
+    tiers = BRANDS[brand]["tiers"]
+    lines = [f"    WHEN '{name}' THEN {len(tiers) - i}" for i, (name, _, _) in enumerate(tiers)]
+    return f"CASE {col}\n" + "\n".join(lines) + "\n  END"
+
+
+def crossing_sql(brand):
+    """The tier-crossing query for one brand.
+
+    tier now: the tier rules applied to lifetime purchases now. The last purchase is
+    within 24h, so a recent-purchase rule always holds.
+    tier before: the same rules applied to lifetime purchases minus the last purchase,
+    where a recent-purchase rule needs the purchase before the last one to fall within
+    that many days before the last one. So a lapsed Hero Rips player at $150 who buys
+    again counts as a new entrant, not as an Insider moving up.
+    A crossing is any row whose tier now ranks above its tier before.
+    """
+    tier_now = tier_sql(
+        brand, "crm.lifetime_purchases_usd", "crm.last_purchase_at", "CURRENT_TIMESTAMP()",
+    )
+    tier_before = tier_sql(
+        brand, "(crm.lifetime_purchases_usd - crm.last_purchase_amount_usd)",
+        "pp.prev_purchase_at", "crm.last_purchase_at",
+    )
+    return (
+        Q_VIP_NEW.replace("__BRAND__", brand)
+        .replace("__TIER_NOW__", tier_now)
+        .replace("__TIER_BEFORE__", tier_before)
+        .replace("__RANK_NOW__", rank_sql(brand, "tier_crossed"))
+        .replace("__RANK_BEFORE__", rank_sql(brand, "prev_tier"))
+    )
+
+
 Q_VIP_NEW = """
 WITH crm_dedup AS (
   -- user_fact_crm contains duplicate rows for 107 user_ids; without this a crossing
-  -- gets reported once per duplicate. It holds both brands: GOATbox only here, so a
-  -- Hero Rips payer is never posted as a GOATbox VIP (01M73R9Y was, 2026-11-11).
+  -- gets reported once per duplicate. It holds both brands, so each brand's post
+  -- reads its own rows only (Hero Rips 01M73R9Y was posted as GOATbox, 2026-11-11).
   SELECT *
   FROM `goatbox-prod.processing_data.user_fact_crm`
-  WHERE brand = 'goatbox'
+  WHERE brand = '__BRAND__'
   QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY last_purchase_at DESC) = 1
+),
+recent AS (
+  SELECT *
+  FROM crm_dedup crm
+  WHERE crm.last_purchase_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+    AND NOT EXISTS (
+      SELECT 1 FROM `goatbox-prod.processing_data.internal_users` iu
+      WHERE iu.user_id = crm.user_id
+    )
+),
+prev_purchase AS (
+  -- The purchase before the last one, for tiers that need a recent purchase.
+  SELECT user_id, event_timestamp AS prev_purchase_at
+  FROM `goatbox-prod.processing_data.flat_purchase_events`
+  WHERE user_id IN (SELECT user_id FROM recent)
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY event_timestamp DESC) = 2
 ),
 vendor_costs AS (
   SELECT
@@ -40,82 +129,38 @@ vendor_costs AS (
     ROUND(SUM(vendor_price + vendor_fee), 2) AS total_vendor_cost
   FROM `goatbox-prod.processing_data.flat_order_vendor_pricing_events`
   GROUP BY user_id
+),
+tiered AS (
+  SELECT
+    crm.user_id,
+    CAST(crm.lifetime_purchases_usd AS FLOAT64)                                   AS ltv_usd,
+    ROUND(
+      CAST(crm.lifetime_purchases_usd AS FLOAT64) - COALESCE(vc.total_vendor_cost, 0),
+      2
+    )                                                                             AS net_spend_usd,
+    (vc.user_id IS NULL)                                                          AS no_vendor_pricing,
+    __TIER_NOW__ AS tier_crossed,
+    -- Tier held immediately before the last purchase. NULL means they were not a
+    -- VIP at all, i.e. this is a brand-new entrant rather than an upgrade.
+    __TIER_BEFORE__ AS prev_tier
+  FROM recent crm
+  LEFT JOIN prev_purchase pp ON pp.user_id = crm.user_id
+  LEFT JOIN vendor_costs vc ON vc.user_id = crm.user_id
 )
-SELECT
-  crm.user_id,
-  CAST(crm.lifetime_purchases_usd AS FLOAT64)                                   AS ltv_usd,
-  ROUND(
-    CAST(crm.lifetime_purchases_usd AS FLOAT64) - COALESCE(vc.total_vendor_cost, 0),
-    2
-  )                                                                               AS net_spend_usd,
-  (vc.user_id IS NULL)                                                            AS no_vendor_pricing,
-  CASE
-    WHEN crm.lifetime_purchases_usd >= 1000
-         AND (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) < 1000 THEN 'GOAT'
-    WHEN crm.lifetime_purchases_usd >= 250
-         AND (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) < 250  THEN 'Gold'
-    WHEN crm.lifetime_purchases_usd >= 100
-         AND (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) < 100  THEN 'VIP'
-  END AS tier_crossed,
-  -- Tier held immediately before the last purchase. NULL means they were not a
-  -- VIP at all, i.e. this is a brand-new entrant rather than an upgrade.
-  CASE
-    WHEN (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) >= 1000 THEN 'GOAT'
-    WHEN (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) >= 250  THEN 'Gold'
-    WHEN (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) >= 100  THEN 'VIP'
-  END AS prev_tier
-FROM crm_dedup crm
-LEFT JOIN vendor_costs vc ON vc.user_id = crm.user_id
-WHERE crm.last_purchase_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-  AND NOT EXISTS (
-    SELECT 1 FROM `goatbox-prod.processing_data.internal_users` iu
-    WHERE iu.user_id = crm.user_id
-  )
-  AND (
-    (crm.lifetime_purchases_usd >= 1000
-      AND (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) < 1000)
-    OR (crm.lifetime_purchases_usd >= 250
-      AND (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) < 250)
-    OR (crm.lifetime_purchases_usd >= 100
-      AND (crm.lifetime_purchases_usd - crm.last_purchase_amount_usd) < 100)
-  )
-ORDER BY crm.lifetime_purchases_usd DESC
+SELECT user_id, ltv_usd, net_spend_usd, no_vendor_pricing, tier_crossed, prev_tier
+FROM tiered
+WHERE tier_crossed IS NOT NULL
+  AND (prev_tier IS NULL OR __RANK_NOW__ > __RANK_BEFORE__)
+ORDER BY ltv_usd DESC
 """
 
+# Last 2 purchases for the users in the post. @user_ids comes from Q_VIP_NEW.
 Q_VIP_PURCHASES = """
-WITH new_vips AS (
-  -- DISTINCT: duplicate crm rows would otherwise fan out the purchase join below
-  SELECT DISTINCT user_id
-  FROM `goatbox-prod.processing_data.user_fact_crm` ufc
-  WHERE brand = 'goatbox'
-    AND last_purchase_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-    AND NOT EXISTS (
-      SELECT 1 FROM `goatbox-prod.processing_data.internal_users` iu
-      WHERE iu.user_id = ufc.user_id
-    )
-    AND (
-      (lifetime_purchases_usd >= 1000
-        AND (lifetime_purchases_usd - last_purchase_amount_usd) < 1000)
-      OR (lifetime_purchases_usd >= 250
-        AND (lifetime_purchases_usd - last_purchase_amount_usd) < 250)
-      OR (lifetime_purchases_usd >= 100
-        AND (lifetime_purchases_usd - last_purchase_amount_usd) < 100)
-    )
-),
-ranked AS (
-  SELECT
-    p.user_id,
-    p.event_timestamp,
-    CAST(p.amount_usd AS FLOAT64) AS amount_usd,
-    p.product_slug,
-    ROW_NUMBER() OVER (PARTITION BY p.user_id ORDER BY p.event_timestamp DESC) AS rn
-  FROM `goatbox-prod.processing_data.flat_purchase_events` p
-  INNER JOIN new_vips n ON n.user_id = p.user_id
-)
-SELECT user_id, event_timestamp, amount_usd, product_slug
-FROM ranked
-WHERE rn <= 2
-ORDER BY user_id, rn
+SELECT user_id, event_timestamp, CAST(amount_usd AS FLOAT64) AS amount_usd, product_slug
+FROM `goatbox-prod.processing_data.flat_purchase_events`
+WHERE user_id IN UNNEST(@user_ids)
+QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY event_timestamp DESC) <= 2
+ORDER BY user_id, event_timestamp DESC
 """
 
 
@@ -126,11 +171,16 @@ def send_error_dm(client, msg):
         pass
 
 
-def run_query(bq, sql):
-    return [dict(r) for r in bq.query(sql).result()]
+def run_query(bq, sql, user_ids=None):
+    if user_ids is None:
+        return [dict(r) for r in bq.query(sql).result()]
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ArrayQueryParameter("user_ids", "STRING", list(user_ids)),
+    ])
+    return [dict(r) for r in bq.query(sql, job_config=job_config).result()]
 
 
-def build_vip_blocks(vip_rows, purchase_rows):
+def build_vip_blocks(vip_rows, purchase_rows, brand="goatbox"):
     IDT = timezone(timedelta(hours=3))
 
     purchases_by_user = {}
@@ -149,7 +199,7 @@ def build_vip_blocks(vip_rows, purchase_rows):
         flag = " ⚠️" if no_vendor_pricing else ""
         return f"{sign}${v:,.2f}{flag}"
 
-    TIER_EMOJI = {"GOAT": "🐐", "Gold": "🥇", "VIP": "⭐"}
+    TIER_EMOJI = POST[brand]["emoji"]
 
     if not vip_rows:
         return [{"type": "section", "text": {"type": "mrkdwn", "text": "No new VIPs or tier upgrades today."}}]
@@ -190,7 +240,8 @@ def build_vip_blocks(vip_rows, purchase_rows):
     blocks = []
     truncated = 0
 
-    for title, rows in (("🆕 New VIP Entrants", new_entrants), ("⬆️ Tier Upgrades", upgrades)):
+    titles = (POST[brand]["new_title"], POST[brand]["up_title"])
+    for title, rows in zip(titles, (new_entrants, upgrades)):
         if not rows:
             continue
         blocks.append({"type": "header", "text": {"type": "plain_text", "text": title}})
@@ -215,21 +266,17 @@ def build_vip_blocks(vip_rows, purchase_rows):
     return blocks
 
 
-def main():
-    slack_token = os.environ.get("SLACK_BOT_TOKEN")
-    if not slack_token:
-        print("ERROR: SLACK_BOT_TOKEN not set", file=sys.stderr)
-        sys.exit(1)
-
-    client = WebClient(token=slack_token)
-    bq = bigquery.Client()
-
-    print("Running VIP queries...")
+def post_brand(client, bq, brand):
+    """Query one brand's tier crossings and post them to #vip. Exits on any error."""
+    label = BRANDS[brand]["label"]
+    print(f"Running {label} VIP queries...")
     try:
-        vip_rows      = run_query(bq, Q_VIP_NEW)
-        purchase_rows = run_query(bq, Q_VIP_PURCHASES) if vip_rows else []
+        vip_rows = run_query(bq, crossing_sql(brand))
+        purchase_rows = (
+            run_query(bq, Q_VIP_PURCHASES, [r["user_id"] for r in vip_rows]) if vip_rows else []
+        )
     except Exception as e:
-        msg = f"BigQuery error: {e}"
+        msg = f"BigQuery error ({label}): {e}"
         print(msg, file=sys.stderr)
         send_error_dm(client, msg)
         sys.exit(1)
@@ -238,13 +285,18 @@ def main():
     n_upgrades = len(vip_rows) - n_new
     print(f"  Tier crossings: {len(vip_rows)} ({n_new} new entrant(s), {n_upgrades} upgrade(s))")
 
-    blocks = build_vip_blocks(vip_rows, purchase_rows)
+    if not vip_rows and not POST[brand]["post_when_empty"]:
+        print(f"  Nothing to post for {label}.")
+        return
+
+    blocks = build_vip_blocks(vip_rows, purchase_rows, brand)
+    name = "" if brand == "goatbox" else f"{label} "
     if vip_rows:
         parts = []
         if n_new:
-            parts.append(f"🆕 {n_new} new VIP entrant(s)")
+            parts.append(f"🆕 {n_new} new {name}VIP entrant(s)")
         if n_upgrades:
-            parts.append(f"⬆️ {n_upgrades} tier upgrade(s)")
+            parts.append(f"⬆️ {n_upgrades} {name}tier upgrade(s)")
         fallback = ", ".join(parts) + " today"
     else:
         fallback = "No new VIPs or tier upgrades today."
@@ -260,10 +312,23 @@ def main():
         )
         print(f"Posted. ts={resp['ts']}")
     except SlackApiError as e:
-        msg = f"Slack error: {e.response['error']}"
+        msg = f"Slack error ({label}): {e.response['error']}"
         print(msg, file=sys.stderr)
         send_error_dm(client, msg)
         sys.exit(1)
+
+
+def main():
+    slack_token = os.environ.get("SLACK_BOT_TOKEN")
+    if not slack_token:
+        print("ERROR: SLACK_BOT_TOKEN not set", file=sys.stderr)
+        sys.exit(1)
+
+    client = WebClient(token=slack_token)
+    bq = bigquery.Client()
+
+    for brand in ("goatbox", "herorips"):
+        post_brand(client, bq, brand)
 
 
 if __name__ == "__main__":
