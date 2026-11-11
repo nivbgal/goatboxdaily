@@ -1,6 +1,7 @@
 """
 vip_report.py
-Checks for VIP tier crossings in the last 24h and posts to #vip.
+Checks for GOATbox VIP tier crossings in the last 24h and posts to #vip. Hero Rips
+players are left out; they have their own tab in the VIP tracker.
 
 Splits crossings into two groups:
   - new entrants  — had no tier before this purchase (crossed $100 for the first time)
@@ -25,10 +26,12 @@ MAX_BLOCKS        = 50              # Slack hard limit per message
 
 Q_VIP_NEW = """
 WITH crm_dedup AS (
-  -- user_fact_crm contains exact duplicate rows for ~82 user_ids; without this
-  -- a crossing gets reported once per duplicate.
+  -- user_fact_crm contains duplicate rows for 107 user_ids; without this a crossing
+  -- gets reported once per duplicate. It holds both brands: GOATbox only here, so a
+  -- Hero Rips payer is never posted as a GOATbox VIP (01M73R9Y was, 2026-11-11).
   SELECT *
   FROM `goatbox-prod.processing_data.user_fact_crm`
+  WHERE brand = 'goatbox'
   QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY last_purchase_at DESC) = 1
 ),
 vendor_costs AS (
@@ -84,7 +87,8 @@ WITH new_vips AS (
   -- DISTINCT: duplicate crm rows would otherwise fan out the purchase join below
   SELECT DISTINCT user_id
   FROM `goatbox-prod.processing_data.user_fact_crm` ufc
-  WHERE last_purchase_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+  WHERE brand = 'goatbox'
+    AND last_purchase_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
     AND NOT EXISTS (
       SELECT 1 FROM `goatbox-prod.processing_data.internal_users` iu
       WHERE iu.user_id = ufc.user_id
