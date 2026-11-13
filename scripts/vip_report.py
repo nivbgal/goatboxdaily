@@ -30,16 +30,16 @@ SLACK_VIP_CHANNEL = "C0BAJM1T8LE"   # #vip
 ERROR_USER_ID     = "U0B0ZF5D6F9"   # niv — receives error DMs
 MAX_BLOCKS        = 50              # Slack hard limit per message
 
-# Per brand: header titles and tier emoji. GOATbox keeps the titles it always had.
+# Per brand: header titles and tier emoji. Every title names the brand (Freya, 2026-11-12).
 POST = {
     "goatbox": {
-        "new_title": "🆕 New VIP Entrants",
-        "up_title": "⬆️ Tier Upgrades",
+        "new_title": "🆕 GOATbox New VIP Entrants",
+        "up_title": "⬆️ GOATbox Tier Upgrades",
         "emoji": {"GOAT": "🐐", "Gold": "🥇", "VIP": "⭐"},
         "post_when_empty": True,
     },
     "herorips": {
-        "new_title": "🆕 New Hero Rips VIP Entrants",
+        "new_title": "🆕 Hero Rips New VIP Entrants",
         "up_title": "⬆️ Hero Rips Tier Upgrades",
         "emoji": {HERORIPS_TOP_TIER: "👑", "Gold": "🥇", "VIP": "⭐", "Insider": "🔹"},
         "post_when_empty": False,
@@ -202,7 +202,8 @@ def build_vip_blocks(vip_rows, purchase_rows, brand="goatbox"):
     TIER_EMOJI = POST[brand]["emoji"]
 
     if not vip_rows:
-        return [{"type": "section", "text": {"type": "mrkdwn", "text": "No new VIPs or tier upgrades today."}}]
+        return [{"type": "section", "text": {"type": "mrkdwn",
+                 "text": f"*{BRANDS[brand]['label']}:* no new VIPs or tier upgrades today."}}]
 
     # prev_tier NULL => they held no tier before this purchase => brand-new entrant
     new_entrants = [r for r in vip_rows if not r.get("prev_tier")]
@@ -290,7 +291,7 @@ def post_brand(client, bq, brand):
         return
 
     blocks = build_vip_blocks(vip_rows, purchase_rows, brand)
-    name = "" if brand == "goatbox" else f"{label} "
+    name = f"{label} "
     if vip_rows:
         parts = []
         if n_new:
@@ -299,7 +300,7 @@ def post_brand(client, bq, brand):
             parts.append(f"⬆️ {n_upgrades} {name}tier upgrade(s)")
         fallback = ", ".join(parts) + " today"
     else:
-        fallback = "No new VIPs or tier upgrades today."
+        fallback = f"{label}: no new VIPs or tier upgrades today."
 
     print("Posting to #vip...")
     try:

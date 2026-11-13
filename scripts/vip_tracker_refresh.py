@@ -35,8 +35,8 @@ Creators: CREATOR_USER_IDS are left out of the Heat Report and get no voucher.
 Brands: user_fact_crm holds GOATbox and Hero Rips rows since 2026-11-10. Each brand has
 its own tab and its own tier config in BRANDS. GOATbox stays on the first tab; Hero Rips
 has a "Hero Rips" tab with the same columns plus goatbox_tier at the far right. A Hero
-Rips row found on the GOATbox tab moves to the Hero Rips tab with every Freya value. The
-Slack heat summary covers GOATbox only.
+Rips row found on the GOATbox tab moves to the Hero Rips tab with every Freya value. Each
+brand gets its own Slack heat summary, GOATbox first (Freya, 2026-11-12).
 
 Env vars required:
   GCP_SERVICE_ACCOUNT_JSON   full JSON of the GCP service account key
@@ -720,7 +720,8 @@ def post_error(slack, msg):
 
 # --- Slack message ---
 
-def build_slack_message(merged_rows, today):
+def build_slack_message(merged_rows, today, brand="goatbox", sheet_url=SHEET_URL):
+    label = BRANDS[brand]["label"]
     lists = build_report_lists(merged_rows, today)
     live = lists["live"]
     counts = label_counts(live)
@@ -752,7 +753,7 @@ def build_slack_message(merged_rows, today):
         )
 
     lines = [
-        f":thermometer: *VIP Heat Report - {today.isoformat()}*",
+        f":thermometer: *{label} VIP Heat Report - {today.isoformat()}*",
         "",
         (
             f":fire: Hot: {counts['Hot']} | "
@@ -760,7 +761,7 @@ def build_slack_message(merged_rows, today):
             f":snowflake: Cold: {counts['Cold']} | "
             f":black_square_button: Inactive: {counts['Inactive']}"
         ),
-        f"Total VIPs: {len(live)}" + (f" (excludes {n_excluded} deleted or creator)" if n_excluded else ""),
+        f"Total {label} VIPs: {len(live)}" + (f" (excludes {n_excluded} deleted or creator)" if n_excluded else ""),
         "",
         (
             f"*Needs attention ({lists['n_never_contacted']} never contacted, then last contact "
@@ -775,8 +776,8 @@ def build_slack_message(merged_rows, today):
         *capped(lists["back_on_site"], fmt_back),
     ]
 
-    # Tier moves detected this run, biggest new tier first. The summary is GOATbox only.
-    rank = tier_rank("goatbox")
+    # Tier moves detected this run, biggest new tier first, in this brand's tier names.
+    rank = tier_rank(brand)
     tier_moves = sorted(
         [r for r in live if r.get("_tier_move") in ("up", "down")],
         key=lambda r: (rank.get(r.get("tier", ""), 0), float(r.get("ltv_usd") or 0)),
@@ -812,7 +813,7 @@ def build_slack_message(merged_rows, today):
     else:
         lines.append("- None")
 
-    lines += ["", f"Tracker updated. Sheet: {SHEET_URL}"]
+    lines += ["", f"Tracker updated. Sheet: {sheet_url}"]
 
     return "\n".join(lines)
 
@@ -1257,6 +1258,9 @@ def main():
         check_email_source(bq, merged["goatbox"])
         print_dry_run_summary(merged["goatbox"], gb_tab["existing"], today)
         print_gift_sample(merged["goatbox"], gift_rows)
+        for brand in BRANDS:
+            print(f"\n--- {BRANDS[brand]['label']} heat summary (not posted) ---")
+            print(build_slack_message(merged[brand], today, brand))
         print("DRY RUN: Sheet and Slack left untouched.")
         return
 
@@ -1274,6 +1278,7 @@ def main():
 
     # Hero Rips tab before GOATbox tab: if it fails, the moved rows are still on the
     # GOATbox tab with Freya's values.
+    tab_ids = {}
     for brand in ("herorips", "goatbox"):
         label = BRANDS[brand]["label"]
         output = tab_output(brand, merged[brand], tabs[brand])
@@ -1295,25 +1300,31 @@ def main():
             print(msg, file=sys.stderr)
             post_error(slack, msg)
             sys.exit(1)
+        tab_ids[brand] = ws.id
         print(f"  {label} tab updated.")
 
-    # --- 6. Post heat summary to Slack #vip (GOATbox only) ---
-    print("Posting heat summary to #vip...")
-    msg = build_slack_message(merged["goatbox"], today)
-
-    try:
-        resp = slack.chat_postMessage(
-            channel=SLACK_CHANNEL,
-            text=msg,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
-        print(f"  Posted. ts={resp['ts']}")
-    except SlackApiError as exc:
-        err = exc.response.get("error", str(exc))
-        print(f"Slack error: {err}", file=sys.stderr)
+    # --- 6. Post one heat summary per brand to Slack #vip, GOATbox first ---
+    # A failed post does not stop the next brand's post; the run still exits 1.
+    failed = False
+    for brand in BRANDS:
+        label = BRANDS[brand]["label"]
+        print(f"Posting {label} heat summary to #vip...")
+        sheet_url = f"{SHEET_URL}#gid={tab_ids[brand]}" if brand in tab_ids else SHEET_URL
+        msg = build_slack_message(merged[brand], today, brand, sheet_url)
+        try:
+            resp = slack.chat_postMessage(
+                channel=SLACK_CHANNEL,
+                text=msg,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+            print(f"  Posted. ts={resp['ts']}")
+        except SlackApiError as exc:
+            err = exc.response.get("error", str(exc))
+            print(f"Slack error ({label}): {err}", file=sys.stderr)
+            failed = True
+    if failed:
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
